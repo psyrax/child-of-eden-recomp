@@ -1,5 +1,12 @@
 # Child of Eden — static recompilation for Linux
 
+> **Current stage: bug hunting — help wanted.** The game boots and is playable, and the first archive (Matrix) now
+> seems to play without known bugs on a ROG Ally. The other archives still have problems that only show up when a
+> person plays them (for example, in Evolution the player can take hits from things that are not visible; under
+> investigation). If you build this with your own copy of the game and find a bug, please
+> [open an issue](../../issues) with the archive, what you saw, your GPU/driver and the `logs/` file of that session —
+> or send a pull request. Do not attach game files, recompiled binaries or long gameplay captures.
+
 An unofficial static recompilation of **Child of Eden** (Xbox 360, 2011) into a native Linux x86_64 executable.
 The game's PowerPC code is translated to C++ with [rexglue-sdk](https://github.com/rexglue/rexglue-sdk) and built
 against its Xenia-derived runtime, which renders with Vulkan. No emulator runs at play time.
