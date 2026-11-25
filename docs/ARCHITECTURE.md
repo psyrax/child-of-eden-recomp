@@ -85,8 +85,9 @@ Noto Sans CJK font installed on the system); the D-pad moves and changes, **A** 
 changes are saved automatically to `bin/eden.toml`. **F4** (keyboard) opens the full technical menu; **F3** the frame
 counter. Compiled shaders are stored in `cache/`; if the package ships `cache_base/` (shaders precompiled with the
 bot), `play.sh` adds whatever is missing to `cache/`, without removing anything. `play.sh` passes
-`--gpu.xenos.readback_memexport=false` (with the factory value the game dropped to 30 and 15 fps for stretches of
-several minutes) and `--gpu.xenos.clear_memory_page_state=false` (with the factory value the runtime re-uploaded
+`--gpu.xenos.readback_memexport=true --gpu.xenos.readback_memexport_lazy=true` (the game reads back on the CPU data
+it computes on the GPU; the stock synchronous readback dropped to 30 and 15 fps for stretches of several minutes, and
+with no readback at all gameplay breaks, see the design notes) and `--gpu.xenos.clear_memory_page_state=false` (with the factory value the runtime re-uploaded
 47 MB of unchanged game memory per frame at the start of the second level, which meant 30 fps on a handheld on
 battery). The game also has its own "Options" menu (vibration, brightness, volume, inverted controls). The save
 is stored in `user/…/eden/eden_game.dat` next to the binary.
@@ -214,8 +215,13 @@ The full list, derived from the code, is in `docs/DEBUG-SWITCHES.md`.
   level the pair goes out as a projection layer with head tracking; in menus, as a floating screen, because the 2D text
   does not go through the camera.
 - **Game ↔ SDK link through `dlsym`:** the GPU library is loaded with `dlopen`; a weak symbol does not get resolved.
-- **`readback_memexport=false`:** the runtime was reading back to memory, waiting for the GPU on every draw, the
-  particles the game computes on the GPU; turning it off removed the 30 and 15 fps stretches with no visible change.
+- **Lazy memexport readback (`readback_memexport_lazy`, patch 0006):** the game computes data on the GPU (memexport)
+  and reads it back on the CPU. The stock readback waits for the GPU on every draw (30 and 15 fps stretches). Turning
+  the readback off fixed the frame rate and looked harmless with the bot, but it broke gameplay: in Evolution the
+  whale's projectiles were born at the world origin instead of on the whale, so they reached the player from behind or
+  from outside the view ("hit by things I cannot see", reported by a person playing; runs 535-540). The lazy mode never
+  waits: when the previous copy has not finished it is picked up by a later draw, so the CPU sees the data a few
+  frames late. Measured: same spawn points as the synchronous readback, 60.0 fps.
 - **Notify the GPU when physical memory is allocated (`PhysicalHeap::NotifyAllocated`):** the runtime marked as "valid
   and written by the GPU" pages that were not allocated and therefore could not be watched; when the next level
   allocated them, the GPU drew with stale data (giant polygons when changing level). It is invalidated on allocation

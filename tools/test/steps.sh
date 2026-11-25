@@ -10,7 +10,7 @@ if [ "$SDL_AUDIODRIVER" = pulseaudio ] && [ "$VIDEO" != pw ]; then
   date +%s.%N > /tmp/audio_start.txt
   timeout 900 parec -d nullsink.monitor --file-format=wav --rate=48000 --channels=2 /b/audio$N.wav &
 fi
-./eden --title.game_root=/assets --gpu.driver=vulkan --gpu.xenos.allow_invalid_fetch_constants=true --gpu.xenos.readback_memexport=false --gpu.xenos.clear_memory_page_state=false --hid.mnk_mode=true $EDEN_EXTRA > /b/run$N.log 2>&1 &
+./eden --title.game_root=/assets --gpu.driver=vulkan --gpu.xenos.allow_invalid_fetch_constants=true --gpu.xenos.readback_memexport=true --gpu.xenos.readback_memexport_lazy=true --gpu.xenos.clear_memory_page_state=false --hid.mnk_mode=true $EDEN_EXTRA > /b/run$N.log 2>&1 &
 E=$!
 # VIDEO=pw (set by run_video.sh): real video. gamescope publishes its image as a PipeWire node; GStreamer encodes it
 # together with the audio of the null sink into /b/video<N>.mkv. Hardware encoder (VA-API) with VIDEO_CODEC=va; otherwise x264.

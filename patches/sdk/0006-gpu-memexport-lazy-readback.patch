@@ -1,0 +1,36 @@
+diff --git a/src/gpu/xenos/vulkan/command_processor.cpp b/src/gpu/xenos/vulkan/command_processor.cpp
+index 6b2573e..2bee9da 100644
+--- a/src/gpu/xenos/vulkan/command_processor.cpp
++++ b/src/gpu/xenos/vulkan/command_processor.cpp
+@@ -4270,6 +4270,16 @@ bool VulkanCommandProcessor::IssueDrawMemexportReadbackFastPath(u32 total_size)
+       total_size <= readback.written_size[read_index] && readback.submission_written[read_index] &&
+       readback.submission_written[read_index] <= submission_completed_;
+   if (!previous_slot_ready) {
++    if (GetXenosSettings().readback_memexport_lazy.Get()) {
++      // eden: never stall on the GPU. The other slot either was never written (first use: start
++      // alternating) or its copy is still in flight (for instance a second export to the same
++      // range in the same frame): leave it alone so it can be read by a later draw, and keep
++      // refreshing this slot. Guest memory keeps the previous data meanwhile.
++      if (!readback.submission_written[read_index]) {
++        readback.current_index = read_index;
++      }
++      return true;
++    }
+     IssueDrawMemexportReadbackFullPath(total_size);
+     readback.current_index = read_index;
+     return true;
+diff --git a/src/gpu/xenos/xenos_settings.h b/src/gpu/xenos/xenos_settings.h
+index d8f88a2..6436806 100644
+--- a/src/gpu/xenos/xenos_settings.h
++++ b/src/gpu/xenos/xenos_settings.h
+@@ -79,6 +79,10 @@ class XenosSettings : public SettingOwner {
+   REX_SETTING(bool, readback_memexport_fast, true,
+               "Use fast double buffered memexport readback when possible, with automatic fallback "
+               "to full synchronous readback");
++  REX_SETTING(bool, readback_memexport_lazy, false,
++              "With the fast memexport readback, never wait for the GPU: when the previous copy is "
++              "not finished yet, keep the data already in guest memory and pick the copy up on a "
++              "later draw. The CPU sees memexport data a few frames late instead of stalling");
+   REX_SETTING(
+       bool, async_shader_compilation, true,
+       "Compile shaders and create pipelines asynchronously in background threads. This reduces "

@@ -13,6 +13,7 @@ also applies on its own. They have to be rebased when the SDK is updated.
 | `0003-xma-audio-fixes` | Tolerates XMA voices without a context and buffers with an invalid packet index, which crashed or hung the audio decoder |
 | `0004-gpu-fixes-and-diagnostics` | Invalidates GPU-side page state when physical memory is allocated (stale geometry after a level change), backs unassigned vertex streams (GPU hang with RADV), a null-safe string append, a register-info lookup table, and per-minute frame/stutter/upload diagnostics |
 | `0005-vr-openxr-output` | Experimental OpenXR output, compiled only with `-DREXGLUE_VR_OPENXR=ON` and active only with `EDEN_VR_OPENXR=1` |
+| `0006-gpu-memexport-lazy-readback` | `gpu.xenos.readback_memexport_lazy`: memexport readback that never waits for the GPU (the copy is picked up a few frames later). Needed because the game reads GPU-computed data on the CPU (projectile spawn points in Evolution) and the stock readback halves the frame rate |
 
 The reasoning and measurements behind each change are in `docs/ARCHITECTURE.md` and `docs/DEVLOG.md`.
 

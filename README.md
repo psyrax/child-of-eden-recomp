@@ -2,8 +2,8 @@
 
 > **Current stage: bug hunting — help wanted.** The game boots and is playable, and the first archive (Matrix) now
 > seems to play without known bugs on a ROG Ally. The other archives still have problems that only show up when a
-> person plays them (for example, in Evolution the player can take hits from things that are not visible; under
-> investigation). If you build this with your own copy of the game and find a bug, please
+> person plays them (the first one found this way, hits from projectiles coming from outside the view in Evolution,
+> is fixed by patch 0006). If you build this with your own copy of the game and find a bug, please
 > [open an issue](../../issues) with the archive, what you saw, your GPU/driver and the `logs/` file of that session —
 > or send a pull request. Do not attach game files, recompiled binaries or long gameplay captures.
 

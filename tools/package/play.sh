@@ -54,11 +54,13 @@ fi
 B="${EDEN_BIN_DIR:-$D/bin}"
 cd "$B" || exit 2
 LD_LIBRARY_PATH="$B${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" exec ./eden --title.game_root="$D/assets" --app.user_root="$D/user" --app.log_root="$D/logs" --app.cache_root="$D/cache" \
-  --gpu.driver=vulkan --gpu.xenos.allow_invalid_fetch_constants=true --gpu.xenos.readback_memexport=false \
+  --gpu.driver=vulkan --gpu.xenos.allow_invalid_fetch_constants=true --gpu.xenos.readback_memexport=true --gpu.xenos.readback_memexport_lazy=true \
   --gpu.xenos.clear_memory_page_state=false "${extra[@]}" ${EDEN_ARGS:-}
-# readback_memexport=false: the runtime was reading back to memory, waiting for the GPU on every draw, the particles the
-# game computes on the GPU; that dropped the frame rate to 30 and 15 fps in busy scenes (runs 430 and 431). To turn it
-# back on: ./play.sh --gpu.xenos.readback_memexport=true
+# readback_memexport=true + readback_memexport_lazy=true: the game computes data on the GPU (memexport) and then READS it
+# from the CPU; in Evolution that is where the point the whale fires from comes from. Without the readback the
+# projectiles were born at the world origin and reached the player from behind (runs 535-540). The stock readback waits
+# for the GPU on every draw and drops to 30 and 15 fps (runs 430, 431, 539); with lazy (patch 0006) the copy is picked
+# up once it has finished, a few frames later, at 60 fps. To turn it off: ./play.sh --gpu.xenos.readback_memexport=false
 # clear_memory_page_state=false: by default the runtime invalidated, at the end of every frame, all the game memory
 # already uploaded to the GPU and copied it again (47 MB per frame when starting the second level, 99.7 % identical;
 # runs 525-529). On a ROG Ally on battery that dropped the frame rate to 30 fps. If broken geometry or missing models
