@@ -1,0 +1,326 @@
+diff --git a/src/hid/sdl3/sdl3_input_driver.cpp b/src/hid/sdl3/sdl3_input_driver.cpp
+index 2ab6d1d..79205f6 100644
+--- a/src/hid/sdl3/sdl3_input_driver.cpp
++++ b/src/hid/sdl3/sdl3_input_driver.cpp
+@@ -15,11 +15,13 @@
+ #include <array>
+ #include <atomic>
+ #include <cctype>
++#include <cmath>
+ #include <mutex>
+ #include <string>
+ #include <vector>
+ 
+ #include <SDL3/SDL.h>
++#include <cstdlib>
+ 
+ #include <rex/driver.h>
+ #include <rex/driver_context.h>
+@@ -162,6 +164,13 @@ struct SDL3InputDriver::State {
+     PadDeviceID id = kInvalidPadDeviceID;
+     PadState state;
+     i32 xinput_slot = -1;
++    // Gyro: sum of samples (rad/s) since the last read and the last average used.
++    bool has_gyro = false;
++    bool gyro_on = false;
++    f64 gyro_sum[3] = {0.0, 0.0, 0.0};
++    u32 gyro_samples = 0;
++    f64 gyro_rate[3] = {0.0, 0.0, 0.0};
++    u64 gyro_tick = 0;
+   };
+ 
+   IDriverContext* context = nullptr;
+@@ -180,6 +189,10 @@ struct SDL3InputDriver::State {
+   std::atomic<bool> events_up{false};
+   std::atomic<bool> gamepad_up{false};
+ 
++  // gyro_test: virtual controller with a gyro, fed from the UI thread.
++  SDL_Joystick* test_joystick = nullptr;
++  void FeedTestGyro();
++
+   static bool EventWatch(void* userdata, SDL_Event* event);
+   void HandleEvent(const SDL_Event& event);
+   std::unique_lock<std::mutex> DrainAndLock();
+@@ -189,6 +202,7 @@ struct SDL3InputDriver::State {
+   void OnGamepadRemovedLocked(const SDL_Event& event);
+   void OnAxisLocked(const SDL_Event& event);
+   void OnButtonLocked(const SDL_Event& event);
++  void OnSensorLocked(const SDL_Event& event);
+   Controller* FindByInstance(SDL_JoystickID instance);
+   Controller* FindByID(PadDeviceID id);
+   void QueuePump(const std::shared_ptr<State>& self);
+@@ -250,6 +264,9 @@ void SDL3InputDriver::State::ProcessEventLocked(const SDL_Event& event) {
+     case SDL_EVENT_GAMEPAD_BUTTON_UP:
+       OnButtonLocked(event);
+       break;
++    case SDL_EVENT_GAMEPAD_SENSOR_UPDATE:
++      OnSensorLocked(event);
++      break;
+     default:
+       break;
+   }
+@@ -280,6 +297,9 @@ void SDL3InputDriver::State::OnGamepadAddedLocked(const SDL_Event& event) {
+   controller.sdl = gamepad;
+   controller.id = PadDeviceID{next_id++};
+   controller.xinput_slot = GetXInputSlot(gamepad);
++  controller.has_gyro = SDL_GamepadHasSensor(gamepad, SDL_SENSOR_GYRO);
++  REXHID_INFO("SDL gamepad \"{}\": gyroscope {}", SDL_GetGamepadName(gamepad),
++              controller.has_gyro ? "present" : "absent");
+   REXHID_DEBUG("SDL GamepadAdded: \"{}\", VendorID(0x{:04X}), ProductID(0x{:04X}), slot {}",
+                SDL_GetGamepadName(gamepad), SDL_GetGamepadVendor(gamepad),
+                SDL_GetGamepadProduct(gamepad), controller.xinput_slot);
+@@ -374,6 +394,95 @@ void SDL3InputDriver::State::OnButtonLocked(const SDL_Event& event) {
+   }
+ }
+ 
++void SDL3InputDriver::State::OnSensorLocked(const SDL_Event& event) {
++  if (event.gsensor.sensor != SDL_SENSOR_GYRO) {
++    return;
++  }
++  Controller* controller = FindByInstance(event.gsensor.which);
++  if (!controller || !controller->gyro_on) {
++    return;
++  }
++  for (int i = 0; i < 3; ++i) {
++    controller->gyro_sum[i] += event.gsensor.data[i];
++  }
++  ++controller->gyro_samples;
++}
++
++// 12 s cycle: 2 s right, 3 s still, 2 s left, 2 s up, 2 s down, 1 s still (40 degrees/s).
++void SDL3InputDriver::State::FeedTestGyro() {
++  if (!test_joystick) {
++    return;
++  }
++  constexpr float kRate = 40.0f * 3.14159265f / 180.0f;
++  const u64 phase = SDL_GetTicks() % 12000;
++  float data[3] = {0.0f, 0.0f, 0.0f};
++  if (phase < 2000) {
++    data[1] = -kRate;
++  } else if (phase >= 5000 && phase < 7000) {
++    data[1] = kRate;
++  } else if (phase >= 7000 && phase < 9000) {
++    data[0] = kRate;
++  } else if (phase >= 9000 && phase < 11000) {
++    data[0] = -kRate;
++  }
++  SDL_SendJoystickVirtualSensorData(test_joystick, SDL_SENSOR_GYRO, SDL_GetTicksNS(), data, 3);
++
++  // Button script for testing: EDEN_PAD_SCRIPT="ms:button:duration_ms,..." (ms since SDL
++  // started). Buttons: start, a, b, x, y, up, down, left, right.
++  struct Step {
++    u64 at;
++    u64 until;
++    SDL_GamepadButton button;
++  };
++  static const std::vector<Step> script = [] {
++    std::vector<Step> steps;
++    const char* env = SDL_getenv("EDEN_PAD_SCRIPT");
++    std::string text = env ? env : "";
++    size_t pos = 0;
++    while (pos < text.size()) {
++      const size_t end = std::min(text.find(',', pos), text.size());
++      const std::string item = text.substr(pos, end - pos);
++      pos = end + 1;
++      const size_t c1 = item.find(':');
++      const size_t c2 = item.find(':', c1 == std::string::npos ? 0 : c1 + 1);
++      if (c1 == std::string::npos || c2 == std::string::npos) {
++        continue;
++      }
++      const std::string name = item.substr(c1 + 1, c2 - c1 - 1);
++      SDL_GamepadButton button = SDL_GAMEPAD_BUTTON_INVALID;
++      if (name == "start") button = SDL_GAMEPAD_BUTTON_START;
++      else if (name == "a") button = SDL_GAMEPAD_BUTTON_SOUTH;
++      else if (name == "b") button = SDL_GAMEPAD_BUTTON_EAST;
++      else if (name == "x") button = SDL_GAMEPAD_BUTTON_WEST;
++      else if (name == "y") button = SDL_GAMEPAD_BUTTON_NORTH;
++      else if (name == "up") button = SDL_GAMEPAD_BUTTON_DPAD_UP;
++      else if (name == "down") button = SDL_GAMEPAD_BUTTON_DPAD_DOWN;
++      else if (name == "left") button = SDL_GAMEPAD_BUTTON_DPAD_LEFT;
++      else if (name == "right") button = SDL_GAMEPAD_BUTTON_DPAD_RIGHT;
++      if (button == SDL_GAMEPAD_BUTTON_INVALID) {
++        continue;
++      }
++      const u64 at = std::strtoull(item.c_str(), nullptr, 10);
++      steps.push_back({at, at + std::strtoull(item.c_str() + c2 + 1, nullptr, 10), button});
++    }
++    return steps;
++  }();
++  if (!script.empty()) {
++    const u64 now = SDL_GetTicks();
++    bool down[SDL_GAMEPAD_BUTTON_COUNT] = {};
++    bool used[SDL_GAMEPAD_BUTTON_COUNT] = {};
++    for (const Step& step : script) {
++      used[step.button] = true;
++      down[step.button] = down[step.button] || (now >= step.at && now < step.until);
++    }
++    for (int i = 0; i < SDL_GAMEPAD_BUTTON_COUNT; ++i) {
++      if (used[i]) {
++        SDL_SetJoystickVirtualButton(test_joystick, static_cast<Uint8>(i), down[i]);
++      }
++    }
++  }
++}
++
+ SDL3InputDriver::State::Controller* SDL3InputDriver::State::FindByInstance(
+     SDL_JoystickID instance) {
+   for (Controller& controller : controllers) {
+@@ -398,6 +507,7 @@ void SDL3InputDriver::State::QueuePump(const std::shared_ptr<State>& self) {
+     return;
+   }
+   context->PostToUIThread([self]() {
++    self->FeedTestGyro();
+     SDL_PumpEvents();
+     self->pump_queued = false;
+   });
+@@ -417,8 +527,9 @@ Result<void> SDL3InputDriver::Initialize(IDriverContext& context) {
+   state_->running = true;
+ 
+   std::filesystem::path mappings = mappings_file.Get();
++  const bool test_gyro = gyro_test.Get();
+   const Result<void> ran =
+-      context.RunOnUIThread([state = state_, mappings = std::move(mappings)]() {
++      context.RunOnUIThread([state = state_, mappings = std::move(mappings), test_gyro]() {
+         if (!state->running) {
+           return;
+         }
+@@ -453,6 +564,28 @@ Result<void> SDL3InputDriver::Initialize(IDriverContext& context) {
+             }
+           }
+         }
++        if (test_gyro) {
++          SDL_VirtualJoystickSensorDesc sensor = {SDL_SENSOR_GYRO, 60.0f};
++          SDL_VirtualJoystickDesc desc;
++          SDL_INIT_INTERFACE(&desc);
++          desc.type = SDL_JOYSTICK_TYPE_GAMEPAD;
++          desc.naxes = SDL_GAMEPAD_AXIS_COUNT;
++          desc.nbuttons = 15;
++          desc.nsensors = 1;
++          desc.sensors = &sensor;
++          desc.name = "Eden gyro test pad";
++          const SDL_JoystickID id = SDL_AttachVirtualJoystick(&desc);
++          state->test_joystick = id ? SDL_OpenJoystick(id) : nullptr;
++          if (!state->test_joystick) {
++            REXHID_ERROR("SDL: gyro test pad failed: {}", SDL_GetError());
++          } else {
++            SDL_SetJoystickVirtualAxis(state->test_joystick, SDL_GAMEPAD_AXIS_LEFT_TRIGGER,
++                                       SDL_JOYSTICK_AXIS_MIN);
++            SDL_SetJoystickVirtualAxis(state->test_joystick, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER,
++                                       SDL_JOYSTICK_AXIS_MIN);
++            REXHID_INFO("SDL: gyro test pad attached");
++          }
++        }
+         REXHID_INFO("SDL input driver initialized");
+       });
+   if (!ran) {
+@@ -479,6 +612,10 @@ void SDL3InputDriver::Shutdown() {
+       }
+       state->controllers.clear();
+     }
++    if (state->test_joystick) {
++      SDL_CloseJoystick(state->test_joystick);
++      state->test_joystick = nullptr;
++    }
+     if (state->gamepad_up) {
+       SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
+       state->gamepad_up = false;
+@@ -533,11 +670,69 @@ Result<PadState> SDL3InputDriver::GetDeviceState(PadDeviceID id) {
+   }
+   state_->QueuePump(state_);
+   auto guard = state_->DrainAndLock();
+-  const State::Controller* controller = state_->FindByID(id);
++  State::Controller* controller = state_->FindByID(id);
+   if (!controller) {
+     return std::unexpected(NotConnected());
+   }
+-  return controller->state;
++  PadState pad = controller->state;
++  if (!controller->has_gyro) {
++    return pad;
++  }
++  const bool want = gyro.Get();
++  if (want != controller->gyro_on) {
++    if (!SDL_SetGamepadSensorEnabled(controller->sdl, SDL_SENSOR_GYRO, want)) {
++      REXHID_WARN("SDL: cannot switch the gyroscope: {}", SDL_GetError());
++      controller->has_gyro = false;
++      return pad;
++    }
++    REXHID_INFO("SDL: gyroscope {}", want ? "on" : "off");
++    controller->gyro_on = want;
++    controller->gyro_samples = 0;
++    for (int i = 0; i < 3; ++i) {
++      controller->gyro_sum[i] = 0.0;
++      controller->gyro_rate[i] = 0.0;
++    }
++  }
++  if (!controller->gyro_on) {
++    return pad;
++  }
++  // Average of the samples received since the previous read; if the sensor is silent for 100 ms, zero.
++  const u64 now = SDL_GetTicks();
++  if (controller->gyro_samples > 0) {
++    for (int i = 0; i < 3; ++i) {
++      controller->gyro_rate[i] = controller->gyro_sum[i] / controller->gyro_samples;
++      controller->gyro_sum[i] = 0.0;
++    }
++    controller->gyro_samples = 0;
++    controller->gyro_tick = now;
++  } else if (now - controller->gyro_tick > 100) {
++    return pad;
++  }
++  // SDL axes: x pitch (positive points up), y yaw (positive turns left),
++  // z roll (positive lowers the left side). Stick: x positive right, y positive up.
++  constexpr f64 kPi = 3.14159265358979323846;
++  constexpr f64 kFullRate = kPi / 2.0;
++  f64 x = -(controller->gyro_rate[1] + gyro_roll.Get() * controller->gyro_rate[2]);
++  f64 y = controller->gyro_rate[0];
++  if (gyro_invert_x.Get()) {
++    x = -x;
++  }
++  if (gyro_invert_y.Get()) {
++    y = -y;
++  }
++  const f64 rate = std::hypot(x, y);
++  const f64 deadzone = gyro_deadzone.Get() * kPi / 180.0;
++  if (rate <= deadzone || rate <= 0.0) {
++    return pad;
++  }
++  const f64 floor = gyro_min_output.Get();
++  const f64 level = std::min(1.0, (rate - deadzone) / kFullRate * gyro_sensitivity.Get());
++  const f64 scale = (floor + (1.0 - floor) * level) / rate * 32767.0;
++  i16& stick_x = gyro_right_stick.Get() ? pad.thumb_rx : pad.thumb_lx;
++  i16& stick_y = gyro_right_stick.Get() ? pad.thumb_ry : pad.thumb_ly;
++  stick_x = static_cast<i16>(std::clamp(stick_x + x * scale, -32768.0, 32767.0));
++  stick_y = static_cast<i16>(std::clamp(stick_y + y * scale, -32768.0, 32767.0));
++  return pad;
+ }
+ 
+ Result<PadCapabilities> SDL3InputDriver::GetDeviceCapabilities(PadDeviceID id) {
+diff --git a/src/hid/sdl3/sdl3_input_driver.h b/src/hid/sdl3/sdl3_input_driver.h
+index 0029758..038cca7 100644
+--- a/src/hid/sdl3/sdl3_input_driver.h
++++ b/src/hid/sdl3/sdl3_input_driver.h
+@@ -33,6 +33,23 @@ class SDL3InputDriver final : public IInputDriver, public SettingOwner {
+  public:
+   REX_SETTING(std::filesystem::path, mappings_file, "{app.root}/gamecontrollerdb.txt",
+               "SDL gamepad mappings file", kStartupOnly);
++  // Gyro (eden-recomp patch): the controller's turn rate is added to a stick.
++  REX_SETTING(bool, gyro, false, "The pad's gyroscope moves a stick");
++  REX_SETTING(bool, gyro_right_stick, false, "The gyroscope moves the right stick, not the left");
++  REX_SETTING(f64, gyro_sensitivity, 1.0, "Gyroscope sensitivity, 1 is full stick at 90 deg/s",
++              Range{0.05, 20.0});
++  REX_SETTING(f64, gyro_deadzone, 1.0, "Turn rate in deg/s the gyroscope ignores",
++              Range{0.0, 30.0});
++  REX_SETTING(f64, gyro_min_output, 0.0,
++              "Stick deflection the smallest gyroscope motion gives, to clear the title's deadzone",
++              Range{0.0, 0.9});
++  REX_SETTING(f64, gyro_roll, 0.0, "How much rolling the pad also moves the stick sideways",
++              Range{0.0, 1.0});
++  REX_SETTING(bool, gyro_invert_x, false, "Invert the gyroscope's horizontal direction");
++  REX_SETTING(bool, gyro_invert_y, false, "Invert the gyroscope's vertical direction");
++  REX_SETTING(bool, gyro_test, false,
++              "Add a virtual pad whose gyroscope turns right, left, up and down in a loop",
++              kStartupOnly);
+ 
+   SDL3InputDriver();
+ 

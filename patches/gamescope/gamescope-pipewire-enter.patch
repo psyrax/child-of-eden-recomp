@@ -1,0 +1,38 @@
+--- a/src/pipewire.cpp
++++ b/src/pipewire.cpp
+@@ -616,6 +616,10 @@
+ {
+ 	pthread_setname_np( pthread_self(), "gamescope-pw" );
+ 
++	// PipeWire >= 1.2: iterate() releases and retakes the loop lock; without enter() the thread that
++	// iterated before keeps the lock and this thread blocks forever.
++	pw_loop_enter(state->loop);
++
+ 	struct pollfd pollfds[] = {
+ 		[EVENT_PIPEWIRE] = {
+ 			.fd = pw_loop_get_fd(state->loop),
+@@ -655,6 +659,7 @@
+ 	}
+ 
+ 	pwr_log.infof("exiting");
++	pw_loop_leave(state->loop);
+ 	pw_stream_destroy(state->stream);
+ 	pw_core_disconnect(state->core);
+ 	pw_context_destroy(state->context);
+@@ -720,13 +725,16 @@
+ 	}
+ 
+ 	state->running = true;
++	pw_loop_enter(state->loop);
+ 	while (state->stream_node_id == SPA_ID_INVALID) {
+ 		int ret = pw_loop_iterate(state->loop, -1);
+ 		if (ret < 0) {
+ 			pwr_log.errorf("pw_loop_iterate failed");
++			pw_loop_leave(state->loop);
+ 			return false;
+ 		}
+ 	}
++	pw_loop_leave(state->loop);
+ 
+ 	pwr_log.infof("stream available on node ID: %u", state->stream_node_id);
+ 

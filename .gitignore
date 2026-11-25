@@ -1,0 +1,9 @@
+# Nothing from the game or from third parties belongs in this repository.
+work/
+*.iso
+*.xex
+*.zip
+*.bin
+*.pyc
+__pycache__/
+.DS_Store

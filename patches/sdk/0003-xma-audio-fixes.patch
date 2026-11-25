@@ -1,0 +1,142 @@
+diff --git a/src/kernel/xma/context.cpp b/src/kernel/xma/context.cpp
+index 6cd1944..6062a59 100644
+--- a/src/kernel/xma/context.cpp
++++ b/src/kernel/xma/context.cpp
+@@ -13,6 +13,8 @@
+  * Derived from https://github.com/koolkdev/libertyv/blob/master/libav_wrapper/xma2dec.c
+  */
+ 
++#include <atomic>
++#include <format>
+ #include <algorithm>
+ #include <cmath>
+ #include <cstring>
+@@ -192,6 +194,18 @@ void XMAContext::Disable() {
+   SetEnabled(false);
+ }
+ 
++std::string XMAContext::EdenDiag() {
++  std::lock_guard<std::mutex> lock(lock_);
++  auto context_ptr = GetAddressSpace()->TranslateVirtual(GetGuestPtr());
++  XMA_CONTEXT_DATA d(context_ptr);
++  return std::format("id={} en={} in0v={} in1v={} buf={} outv={} read={} loops={} stop={} err={} pk0={} pk1={} wr={} rd={}",
++                     GetID(), IsEnabled() ? 1 : 0, u32(d.input_buffer_0_valid), u32(d.input_buffer_1_valid),
++                     u32(d.current_buffer), u32(d.output_buffer_valid), u32(d.input_buffer_read_offset),
++                     u32(d.loop_count), u32(d.stop_when_done), u32(d.error_status), u32(d.input_buffer_0_packet_count),
++                     u32(d.input_buffer_1_packet_count), u32(d.output_buffer_write_offset),
++                     u32(d.output_buffer_read_offset));
++}
++
+ void XMAContext::Release() {
+   std::lock_guard<std::mutex> lock(lock_);
+   REX_ASSERT(IsAllocated());
+@@ -541,8 +555,15 @@ void XMAContext::Decode(XMA_CONTEXT_DATA* data) {
+   const i16 packet_index = GetPacketNumber(current_input_size, data->input_buffer_read_offset);
+ 
+   if (packet_index == -1) {
+-    REXAPU_ERROR("XMAContext {}: Invalid packet index, input read offset {}", GetID(),
+-                 static_cast<u32>(data->input_buffer_read_offset));
++    // eden: without this the context stays at this point forever (the offset does not advance) and the
++    // decoder repeats the error endlessly: 90 GB of log and the game hung in run 429.
++    // The current buffer is treated as consumed and it moves on to the next one, as the skip_count == 0xFF case does.
++    static std::atomic<u32> eden_warnings{0};
++    if (eden_warnings.fetch_add(1, std::memory_order_relaxed) < 20) {
++      REXAPU_ERROR("XMAContext {}: Invalid packet index, input read offset {}; dropping the buffer", GetID(),
++                   static_cast<u32>(data->input_buffer_read_offset));
++    }
++    SwapInputBuffer(data);
+     return;
+   }
+ 
+diff --git a/src/kernel/xma/context.h b/src/kernel/xma/context.h
+index 106e9b7..799f898 100644
+--- a/src/kernel/xma/context.h
++++ b/src/kernel/xma/context.h
+@@ -13,6 +13,7 @@
+ 
+ #include <array>
+ #include <atomic>
++#include <string>
+ #include <mutex>
+ 
+ #include <rex/kernel/heap.h>
+@@ -187,6 +188,8 @@ class XMAContext {
+   u32 GetID() const { return id_; }
+   u32 GetGuestPtr() const { return guest_ptr_; }
+   bool IsAllocated() { return is_allocated_.load(std::memory_order_acquire); }
++  /** eden: compact context state, to diagnose contexts the game never releases. */
++  std::string EdenDiag();
+   bool IsEnabled() { return is_enabled_.load(std::memory_order_acquire); }
+ 
+   void SetAllocated(bool is_allocated) {
+diff --git a/src/kernel/xma/decoder.cpp b/src/kernel/xma/decoder.cpp
+index 9d6ae97..f64bb01 100644
+--- a/src/kernel/xma/decoder.cpp
++++ b/src/kernel/xma/decoder.cpp
+@@ -9,6 +9,9 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <atomic>
++#include <chrono>
++#include <cstdlib>
+ #include <bit>
+ 
+ #include "kernel/xma/context.h"
+@@ -159,11 +162,47 @@ int XMADecoder::GetContextID(u32 context_ptr) const {
+   return static_cast<int>((context_ptr - context_data_first_ptr_) >> 6);
+ }
+ 
++namespace {
++// eden: count of live XMA contexts, so that a leak or an exhaustion shows up in the log.
++std::atomic<u32> g_xma_live{0}, g_xma_peak{0}, g_xma_created{0}, g_xma_released{0};
++std::chrono::steady_clock::time_point g_xma_born[320];
++}  // namespace
++
+ u32 XMADecoder::AllocateContext() {
++  // eden: EDEN_XMA_MAX=<n> caps the contexts to exercise the exhaustion path (testing only).
++  static const u32 cap = [] {
++    const char* e = std::getenv("EDEN_XMA_MAX");
++    return (e && *e) ? static_cast<u32>(std::atoi(e)) : kContextCount;
++  }();
++  if (g_xma_live.load() >= cap) {
++    static std::atomic<u32> warnings{0};
++    if (warnings.fetch_add(1) < 20) REXAPU_WARN("XMA: test cap EDEN_XMA_MAX={} reached, context denied", cap);
++    return 0;
++  }
+   size_t index = context_bitmap_.AcquireEntry();
+   if (index == static_cast<size_t>(-1)) {
++    REXAPU_WARN("XMA: no free contexts left ({} in use of {}; created {}, released {})",
++                g_xma_live.load(), kContextCount, g_xma_created.load(), g_xma_released.load());
+     return 0;
+   }
++  g_xma_created.fetch_add(1);
++  const u32 live = g_xma_live.fetch_add(1) + 1;
++  u32 peak = g_xma_peak.load();
++  while (live > peak && !g_xma_peak.compare_exchange_weak(peak, live)) {
++  }
++  const auto now = std::chrono::steady_clock::now();
++  g_xma_born[index] = now;
++  if (live > peak && live % 16 == 0) {
++    REXAPU_WARN("XMA: {} contexts in use (new peak; created {}, released {})", live, g_xma_created.load(),
++                g_xma_released.load());
++    if (std::getenv("EDEN_XMA_DIAG")) {
++      for (u32 n = 0; n < kContextCount; ++n) {
++        if (n == index || !contexts_[n].IsAllocated()) continue;
++        const double age = std::chrono::duration<double>(now - g_xma_born[n]).count();
++        if (age > 20.0) REXAPU_WARN("XMA: old {:.0f}s {}", age, contexts_[n].EdenDiag());
++      }
++    }
++  }
+ 
+   XMAContext& context = contexts_[index];
+   REX_ASSERT(!context.IsAllocated());
+@@ -183,6 +222,8 @@ void XMADecoder::ReleaseContext(u32 context_ptr) {
+   }
+   context.Release();
+   context_bitmap_.ReleaseEntry(context_id);
++  g_xma_released.fetch_add(1);
++  g_xma_live.fetch_sub(1);
+ }
+ 
+ bool XMADecoder::BlockOnContext(u32 context_ptr, bool poll) {

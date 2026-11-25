@@ -1,0 +1,926 @@
+diff --git a/include/rex/hid/input_system.h b/include/rex/hid/input_system.h
+index 9aef69e..47517de 100644
+--- a/include/rex/hid/input_system.h
++++ b/include/rex/hid/input_system.h
+@@ -72,6 +72,21 @@ REX_DECLARE_INTERFACE(IInputSystem, 2)
+    */
+   [[nodiscard]] virtual Result<PadReading> GetState(u32 user) = 0;
+ 
++  /**
++   * Reads a user's pad even while a UI block is held. For the overlay's own pad navigation.
++   *
++   * @param user Slot 0 to 3.
++   * @return The merged state, or kNotFound when no pad is assigned to the user.
++   */
++  [[nodiscard]] virtual Result<PadState> GetRawState(u32 user) = 0;
++
++  /**
++   * Makes user 0's START wait for its release: a press shorter than hold_ms reaches the title as a
++   * short tap after the release, a longer one never does. For the overlay the pad opens by holding
++   * START. 0 turns it off.
++   */
++  virtual void SetStartHoldMs(u32 hold_ms) = 0;
++
+   /**
+    * Returns the capabilities of a user's pad, with the guide bit cleared when guide_button is off,
+    * or kNotFound.
+diff --git a/include/rex/ui/ui_system.h b/include/rex/ui/ui_system.h
+index 61a6405..75e294c 100644
+--- a/include/rex/ui/ui_system.h
++++ b/include/rex/ui/ui_system.h
+@@ -141,6 +141,11 @@ class REX_UI_API UISettings final : public SettingOwner {
+               kRestart);
+   REX_SETTING(f64, cursor_timeout, 0.0, "Seconds before an idle cursor hides, 0 never hides",
+               Range{0.0, 3600.0});
++  REX_SETTING(std::string, language, "en", "Language of the pad settings menu",
++              Allowed("en", "es", "fr", "de", "it", "pt", "ja"));
++  REX_SETTING(i32, pad_menu_hold_ms, 800,
++              "Milliseconds START is held to open the settings overlay with the pad, 0 disables",
++              Range{0, 5000});
+ };
+ 
+ /**
+@@ -233,6 +238,9 @@ REX_DECLARE_INTERFACE(IUISystem, 2)
+ 
+   virtual void ToggleOverlay(std::string_view name) = 0;
+ 
++  /** Asks the app to close, as closing the window does. Any thread. */
++  virtual void RequestQuit() = 0;
++
+   /**
+    * @return The overlay, or kNotFound.
+    */
+diff --git a/src/hid/input_system.cpp b/src/hid/input_system.cpp
+index 5ec15f9..0f0008c 100644
+--- a/src/hid/input_system.cpp
++++ b/src/hid/input_system.cpp
+@@ -80,6 +80,13 @@ struct InputSystem::State {
+   std::array<u64, detail::kMaxUsers> last_signature{};
+   std::atomic<i32> ui_blocks{0};
+ 
++  // START hold for the pad menu: see IInputSystem::SetStartHoldMs.
++  std::atomic<u32> start_hold_ms{0};
++  bool start_down = false;
++  bool start_swallowed = false;
++  std::chrono::steady_clock::time_point start_since;
++  std::chrono::steady_clock::time_point start_tap_until;
++
+   std::atomic<bool> focused{true};
+   std::atomic<bool> captured{true};
+   std::array<std::atomic<u64>, 4> keys{};
+@@ -246,6 +253,26 @@ Result<InputSystem::PadReading> InputSystem::State::ReadUserLocked(u32 user) {
+     return std::unexpected(raw.error());
+   }
+   rex::hid::PadState state = *raw;
++  if (const u32 hold_ms = start_hold_ms.load(std::memory_order_relaxed); user == 0 && hold_ms > 0) {
++    const auto now = std::chrono::steady_clock::now();
++    const bool down = (state.buttons & rex::hid::kPadStart) != 0;
++    if (down && !start_down) {
++      start_since = now;
++      // A press that starts while the UI holds the pad belongs to the UI, never to the title.
++      start_swallowed = ui_blocks.load() > 0;
++    }
++    if (down && now - start_since >= std::chrono::milliseconds(hold_ms)) {
++      start_swallowed = true;
++    }
++    if (!down && start_down && !start_swallowed) {
++      start_tap_until = now + std::chrono::milliseconds(120);
++    }
++    start_down = down;
++    state.buttons = static_cast<u16>(state.buttons & ~rex::hid::kPadStart);
++    if (now < start_tap_until) {
++      state.buttons = static_cast<u16>(state.buttons | rex::hid::kPadStart);
++    }
++  }
+   if (ui_blocks.load() > 0) {
+     state = {};
+   } else if (consumed[user] != 0) {
+@@ -370,6 +397,19 @@ void InputSystem::Stop() {
+   state.started = false;
+ }
+ 
++void InputSystem::SetStartHoldMs(u32 hold_ms) {
++  state_->start_hold_ms.store(hold_ms, std::memory_order_relaxed);
++}
++
++Result<rex::hid::PadState> InputSystem::GetRawState(u32 user) {
++  State& state = *state_;
++  std::lock_guard lock(state.mutex);
++  if (!state.started) {
++    return std::unexpected(NotFound("input is not started"));
++  }
++  return state.ReadRawLocked(user);
++}
++
+ Result<InputSystem::PadReading> InputSystem::GetState(u32 user) {
+   State& state = *state_;
+   std::vector<ConnectionEvent> events;
+diff --git a/src/hid/input_system.h b/src/hid/input_system.h
+index 54b30c0..d897b38 100644
+--- a/src/hid/input_system.h
++++ b/src/hid/input_system.h
+@@ -33,6 +33,8 @@ class InputSystem final : public rex::hid::IInputSystem {
+ 
+   rex::hid::InputSettings& GetSettings() override { return settings_; }
+   [[nodiscard]] Result<PadReading> GetState(u32 user) override;
++  [[nodiscard]] Result<rex::hid::PadState> GetRawState(u32 user) override;
++  void SetStartHoldMs(u32 hold_ms) override;
+   [[nodiscard]] Result<rex::hid::PadCapabilities> GetCapabilities(u32 user) override;
+   [[nodiscard]] Result<void> SetVibration(u32 user, const rex::hid::PadVibration& motors) override;
+   [[nodiscard]] Result<rex::hid::PadKeystroke> GetKeystroke(u32 user,
+diff --git a/src/ui/imgui_host.cpp b/src/ui/imgui_host.cpp
+index c05cc8a..693a1cc 100644
+--- a/src/ui/imgui_host.cpp
++++ b/src/ui/imgui_host.cpp
+@@ -306,6 +306,7 @@ void ImGuiHost::Initialize() {
+ 
+   io.IniFilename = nullptr;
+   io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
++  io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+ 
+   ImFontConfig font_config;
+   font_config.OversampleH = font_config.OversampleV = 1;
+@@ -318,6 +319,40 @@ void ImGuiHost::Initialize() {
+   io.Fonts->AddFontFromMemoryCompressedBase85TTF(kProggyTinyCompressedDataBase85, 10.0f,
+                                                  &font_config, kFontGlyphRanges);
+ 
++#if !REX_PLATFORM_WIN32
++  // eden: Japanese for the pad menu comes from a system Noto Sans CJK, when there is one.
++  static constexpr const char* kCjkFontPaths[] = {
++      "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
++      "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
++      "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
++      "/usr/share/fonts/noto-cjk/NotoSansCJKjp-Regular.otf",
++      "/usr/share/fonts/opentype/noto/NotoSansCJKjp-Regular.otf",
++      "/usr/share/fonts/OTF/NotoSansCJK-Regular.ttc",
++      "/usr/share/fonts/adobe-source-han-sans/SourceHanSansJP-Regular.otf",
++  };
++  bool cjk_loaded = false;
++  for (const char* cjk_font_path : kCjkFontPaths) {
++    std::error_code cjk_error;
++    if (!std::filesystem::exists(cjk_font_path, cjk_error)) {
++      continue;
++    }
++    ImFontConfig cjk_font_config;
++    cjk_font_config.MergeMode = true;
++    cjk_font_config.OversampleH = cjk_font_config.OversampleV = 1;
++    cjk_font_config.PixelSnapH = true;
++    cjk_font_config.FontNo = 0;
++    if (io.Fonts->AddFontFromFileTTF(cjk_font_path, 13.0f, &cjk_font_config,
++                                     io.Fonts->GetGlyphRangesJapanese())) {
++      REXUI_INFO("CJK font for the pad menu: {}", cjk_font_path);
++      cjk_loaded = true;
++      break;
++    }
++  }
++  if (!cjk_loaded) {
++    REXUI_INFO("No system CJK font found, Japanese is left out of the pad menu");
++  }
++#endif
++
+ #if REX_PLATFORM_WIN32
+   const char* jp_font_path = "C:\\Windows\\Fonts\\msgothic.ttc";
+   if (std::filesystem::exists(jp_font_path)) {
+@@ -349,6 +384,11 @@ bool ImGuiHost::NeedsContinuousPaint() const {
+          });
+ }
+ 
++void ImGuiHost::SetPadState(const rex::hid::PadState* pad) {
++  pad_active_ = pad != nullptr;
++  pad_ = pad ? *pad : rex::hid::PadState{};
++}
++
+ ImDrawData* ImGuiHost::BuildFrame() {
+   if (dialogs_.empty() || IsDrawingDialogs()) {
+     return nullptr;
+@@ -368,6 +408,45 @@ ImDrawData* ImGuiHost::BuildFrame() {
+   io.DisplaySize.x = static_cast<f32>(display_width_) / content_scale_;
+   io.DisplaySize.y = static_cast<f32>(display_height_) / content_scale_;
+ 
++  if (pad_active_ || pad_was_active_) {
++    using namespace rex::hid;
++    const PadState pad = pad_active_ ? pad_ : PadState{};
++    if (pad_active_) {
++      io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
++    } else {
++      io.BackendFlags &= ~ImGuiBackendFlags_HasGamepad;
++    }
++    const auto button = [&](ImGuiKey key, u16 mask) {
++      io.AddKeyEvent(key, (pad.buttons & mask) != 0);
++    };
++    const auto analog = [&](ImGuiKey key, f32 value, f32 deadzone) {
++      const f32 v = value <= deadzone ? 0.0f : std::min(1.0f, (value - deadzone) / (1.0f - deadzone));
++      io.AddKeyAnalogEvent(key, v > 0.0f, v);
++    };
++    button(ImGuiKey_GamepadDpadUp, kPadDPadUp);
++    button(ImGuiKey_GamepadDpadDown, kPadDPadDown);
++    button(ImGuiKey_GamepadDpadLeft, kPadDPadLeft);
++    button(ImGuiKey_GamepadDpadRight, kPadDPadRight);
++    button(ImGuiKey_GamepadFaceDown, kPadA);
++    button(ImGuiKey_GamepadFaceRight, kPadB);
++    button(ImGuiKey_GamepadFaceLeft, kPadX);
++    button(ImGuiKey_GamepadFaceUp, kPadY);
++    button(ImGuiKey_GamepadL1, kPadLeftShoulder);
++    button(ImGuiKey_GamepadR1, kPadRightShoulder);
++    const f32 lx = static_cast<f32>(pad.thumb_lx) / 32767.0f;
++    const f32 ly = static_cast<f32>(pad.thumb_ly) / 32767.0f;
++    analog(ImGuiKey_GamepadLStickLeft, -lx, 0.3f);
++    analog(ImGuiKey_GamepadLStickRight, lx, 0.3f);
++    analog(ImGuiKey_GamepadLStickUp, ly, 0.3f);
++    analog(ImGuiKey_GamepadLStickDown, -ly, 0.3f);
++    analog(ImGuiKey_GamepadL2, static_cast<f32>(pad.left_trigger) / 255.0f, 0.1f);
++    analog(ImGuiKey_GamepadR2, static_cast<f32>(pad.right_trigger) / 255.0f, 0.1f);
++    // A handheld screen is small and dense: scale the text with the display height.
++    const f32 scale = pad_active_ ? std::clamp(io.DisplaySize.y / 540.0f, 1.0f, 4.0f) : 1.0f;
++    ImGui::GetStyle().FontScaleMain = scale;
++    pad_was_active_ = pad_active_;
++  }
++
+   ImGui::NewFrame();
+   capture_.Update(io);
+ 
+diff --git a/src/ui/imgui_host.h b/src/ui/imgui_host.h
+index c26b321..30a97d4 100644
+--- a/src/ui/imgui_host.h
++++ b/src/ui/imgui_host.h
+@@ -24,6 +24,7 @@
+ #include <rex/types.h>
+ #include <rex/ui/ui_system.h>
+ #include <rex/ui/ui_event.h>
++#include <rex/hid/pad.h>
+ 
+ #include "ui/input_capture.h"
+ 
+@@ -59,6 +60,8 @@ class ImGuiHost final {
+   bool HandleEvent(UIEvent& event);
+   void HandleEvent(InputEvent& event);
+   ImDrawData* BuildFrame();
++  /** The pad that drives the navigation of the next frame, or nullptr for none. UI thread. */
++  void SetPadState(const rex::hid::PadState* pad);
+   bool NeedsContinuousPaint() const;
+ 
+  private:
+@@ -95,6 +98,9 @@ class ImGuiHost final {
+   bool reset_mouse_position_after_next_frame_ = false;
+   bool text_input_active_ = false;
+   bool changed_ = false;
++  bool pad_active_ = false;
++  bool pad_was_active_ = false;
++  rex::hid::PadState pad_{};
+   u32 display_width_ = 0;
+   u32 display_height_ = 0;
+   f32 content_scale_ = 1.0f;
+diff --git a/src/ui/overlay/settings_overlay.cpp b/src/ui/overlay/settings_overlay.cpp
+index ae87647..205a6bd 100644
+--- a/src/ui/overlay/settings_overlay.cpp
++++ b/src/ui/overlay/settings_overlay.cpp
+@@ -15,6 +15,9 @@
+ #include <rex/ui/style.h>
+ 
+ #include <algorithm>
++#include <cmath>
++#include <format>
++#include <span>
+ #include <limits>
+ #include <map>
+ #include <optional>
+@@ -191,7 +194,350 @@ static rex::KeyModifiers HeldModifiers(const ImGuiIO& io) {
+   return mods;
+ }
+ 
++namespace {
++
++struct SimpleChoice {
++  const char* value;
++  const char* label;
++};
++
++// eden: every text of the pad menu, one entry per language. English is first and is the fallback.
++struct MenuText {
++  const char* code;
++  const char* name;  // In its own language, for the selector.
++  const char* title;
++  const char* back;
++  const char* language;
++  const char* fps;
++  const char* fps_normal;
++  const char* fps_battery;
++  const char* quality;
++  const char* quality_normal;
++  const char* quality_high;
++  const char* quality_very_high;
++  const char* smooth;
++  const char* no;
++  const char* yes;
++  const char* strong;
++  const char* mute;
++  const char* volume;
++  const char* gyro;
++  const char* sensitivity;
++  const char* invert_x;
++  const char* invert_y;
++  const char* counter;
++  const char* advanced;
++  const char* quit;
++  const char* quit_confirm;
++  const char* save_failed;
++  const char* restart_needed;
++  const char* hint;
++  const char* back_simple;
++};
++
++constexpr MenuText kMenuTexts[] = {
++    {"en", "English", "Child of Eden - Settings", "Back to the game", "Language",
++     "Frames per second", "60 (normal)", "30 (saves battery)",
++     "Image quality", "Normal (720p)", "High (1440p)", "Very high (2160p)",
++     "Smooth edges", "No", "Yes", "Strong", "Mute", "Volume",
++     "Aim by moving the console", "Sensitivity", "Invert horizontal", "Invert vertical",
++     "Show or hide the frame counter", "Advanced options (technical)",
++     "Quit the game", "Press again to quit the game",
++     "The change could not be saved.", "This change applies the next time you open the game.",
++     "D-pad: move and change    A: select    START: close", "< Back to the simple menu"},
++    {"es", "Espa\u00f1ol", "Child of Eden - Ajustes", "Volver al juego", "Idioma",
++     "Cuadros por segundo", "60 (normal)", "30 (ahorra bater\u00eda)",
++     "Calidad de imagen", "Normal (720p)", "Alta (1440p)", "Muy alta (2160p)",
++     "Suavizar bordes", "No", "S\u00ed", "Fuerte", "Silenciar", "Volumen",
++     "Apuntar moviendo la consola", "Sensibilidad", "Invertir horizontal", "Invertir vertical",
++     "Mostrar u ocultar el contador de cuadros", "Opciones avanzadas (t\u00e9cnicas)",
++     "Salir del juego", "Presiona otra vez para salir del juego",
++     "No se pudo guardar el cambio.", "Este cambio se aplica la pr\u00f3xima vez que abras el juego.",
++     "Cruceta: mover y cambiar    A: elegir    START: cerrar", "< Volver al men\u00fa simple"},
++    {"fr", "Fran\u00e7ais", "Child of Eden - R\u00e9glages", "Retour au jeu", "Langue",
++     "Images par seconde", "60 (normal)", "30 (\u00e9conomise la batterie)",
++     "Qualit\u00e9 d'image", "Normale (720p)", "Haute (1440p)", "Tr\u00e8s haute (2160p)",
++     "Lisser les contours", "Non", "Oui", "Fort", "Couper le son", "Volume",
++     "Viser en bougeant la console", "Sensibilit\u00e9", "Inverser l'horizontale", "Inverser la verticale",
++     "Afficher ou masquer le compteur d'images", "Options avanc\u00e9es (techniques)",
++     "Quitter le jeu", "Appuyez encore pour quitter le jeu",
++     "Le changement n'a pas pu \u00eatre enregistr\u00e9.",
++     "Ce changement s'appliquera au prochain lancement du jeu.",
++     "Croix : d\u00e9placer et changer    A : choisir    START : fermer", "< Retour au menu simple"},
++    {"de", "Deutsch", "Child of Eden - Einstellungen", "Zur\u00fcck zum Spiel", "Sprache",
++     "Bilder pro Sekunde", "60 (normal)", "30 (spart Akku)",
++     "Bildqualit\u00e4t", "Normal (720p)", "Hoch (1440p)", "Sehr hoch (2160p)",
++     "Kanten gl\u00e4tten", "Nein", "Ja", "Stark", "Stumm", "Lautst\u00e4rke",
++     "Zielen durch Bewegen der Konsole", "Empfindlichkeit", "Horizontal umkehren", "Vertikal umkehren",
++     "Bildz\u00e4hler ein- oder ausblenden", "Erweiterte Optionen (technisch)",
++     "Spiel beenden", "Zum Beenden erneut dr\u00fccken",
++     "Die \u00c4nderung konnte nicht gespeichert werden.",
++     "Diese \u00c4nderung gilt ab dem n\u00e4chsten Start des Spiels.",
++     "Steuerkreuz: bewegen und \u00e4ndern    A: w\u00e4hlen    START: schlie\u00dfen",
++     "< Zur\u00fcck zum einfachen Men\u00fc"},
++    {"it", "Italiano", "Child of Eden - Impostazioni", "Torna al gioco", "Lingua",
++     "Fotogrammi al secondo", "60 (normale)", "30 (risparmia batteria)",
++     "Qualit\u00e0 dell'immagine", "Normale (720p)", "Alta (1440p)", "Molto alta (2160p)",
++     "Smussa i bordi", "No", "S\u00ec", "Forte", "Silenzia", "Volume",
++     "Mira muovendo la console", "Sensibilit\u00e0", "Inverti orizzontale", "Inverti verticale",
++     "Mostra o nascondi il contatore dei fotogrammi", "Opzioni avanzate (tecniche)",
++     "Esci dal gioco", "Premi di nuovo per uscire dal gioco",
++     "Impossibile salvare la modifica.",
++     "Questa modifica si applica al prossimo avvio del gioco.",
++     "Croce: muovi e cambia    A: scegli    START: chiudi", "< Torna al menu semplice"},
++    {"pt", "Portugu\u00eas", "Child of Eden - Ajustes", "Voltar ao jogo", "Idioma",
++     "Quadros por segundo", "60 (normal)", "30 (poupa bateria)",
++     "Qualidade de imagem", "Normal (720p)", "Alta (1440p)", "Muito alta (2160p)",
++     "Suavizar bordas", "N\u00e3o", "Sim", "Forte", "Silenciar", "Volume",
++     "Mirar movendo o console", "Sensibilidade", "Inverter horizontal", "Inverter vertical",
++     "Mostrar ou ocultar o contador de quadros", "Op\u00e7\u00f5es avan\u00e7adas (t\u00e9cnicas)",
++     "Sair do jogo", "Pressione de novo para sair do jogo",
++     "N\u00e3o foi poss\u00edvel salvar a altera\u00e7\u00e3o.",
++     "Esta altera\u00e7\u00e3o vale na pr\u00f3xima vez que voc\u00ea abrir o jogo.",
++     "Direcional: mover e alterar    A: escolher    START: fechar", "< Voltar ao menu simples"},
++    // Needs a CJK font: see MenuTextUsable.
++    {"ja", "日本語", "Child of Eden - 設定", "ゲームに戻る", "言語",
++     "フレームレート", "60（標準）", "30（バッテリー節約）",
++     "画質", "標準（720p）", "高（1440p）", "最高（2160p）",
++     "アンチエイリアス", "オフ", "オン", "強", "ミュート", "音量",
++     "本体を動かして照準", "感度", "左右を反転", "上下を反転",
++     "フレームカウンターの表示切替", "詳細オプション（技術者向け）",
++     "ゲームを終了", "もう一度押すと終了します",
++     "変更を保存できませんでした。", "この変更は次回の起動時に反映されます。",
++     "十字キー：移動と変更    A：決定    START：閉じる", "< 簡易メニューに戻る"},
++};
++
++// Japanese is only offered when the font can draw it.
++bool MenuTextUsable(const MenuText& text) {
++  if (std::string_view(text.code) != "ja") {
++    return true;
++  }
++  ImFont* font = ImGui::GetFont();
++  return font && font->IsGlyphInFont(static_cast<ImWchar>(0x8A2D)) &&
++         font->IsGlyphInFont(static_cast<ImWchar>(0x3042));
++}
++
++const MenuText& MenuTextFor(std::string_view code) {
++  for (const MenuText& text : kMenuTexts) {
++    if (code == text.code && MenuTextUsable(text)) {
++      return text;
++    }
++  }
++  return kMenuTexts[0];
++}
++
++}  // namespace
++
++bool SettingsOverlayDialog::DrawSimple(ImGuiIO& io) {
++  const f32 scale = ImGui::GetStyle().FontScaleMain;
++  const f32 width = std::min(io.DisplaySize.x * 0.8f, 460.0f * scale);
++  ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always,
++                          ImVec2(0.5f, 0.5f));
++  ImGui::SetNextWindowSize(ImVec2(width, 0.0f), ImGuiCond_Always);
++  ImGui::SetNextWindowBgAlpha(0.92f);
++  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0f * scale, 12.0f * scale));
++  ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f * scale, 6.0f * scale));
++  ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.0f * scale, 5.0f * scale));
++  ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign, ImVec2(0.0f, 0.5f));
++  const MenuText* active_text = &kMenuTexts[0];
++  if (auto language_var = settings_.Find("ui.language"); language_var && *language_var) {
++    active_text = &MenuTextFor((*language_var)->GetText());
++  }
++  const MenuText& tr = *active_text;
++  // "###" keeps the window's identity when the title changes with the language.
++  const bool open = ImGui::Begin((std::string(tr.title) + "###simple").c_str(), nullptr,
++                                 ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize |
++                                     ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
++  bool keep = true;
++  if (open) {
++    const bool appearing = ImGui::IsWindowAppearing();
++    int row_index = 0;
++    // A row is a full-width button. Returns +1 for A or right, -1 for left, 0 for nothing.
++    // The pad is the only input here: keep the focus rectangle on screen.
++    ImGui::SetNavCursorVisible(true);
++    const auto row = [&](const std::string& text, const char* id) -> int {
++      ImGui::PushID(id);
++      if (row_index == 0 && appearing) {
++        ImGui::SetKeyboardFocusHere();
++      }
++      ++row_index;
++      // "###" keeps the item's identity when its text changes, so the focus stays on the row.
++      int delta = ImGui::Button((text + "###row").c_str(), ImVec2(-1.0f, 0.0f)) ? 1 : 0;
++      if (ImGui::IsItemFocused()) {
++        if (ImGui::IsKeyPressed(ImGuiKey_GamepadDpadRight, false)) {
++          delta = 1;
++        } else if (ImGui::IsKeyPressed(ImGuiKey_GamepadDpadLeft, false)) {
++          delta = -1;
++        }
++      }
++      ImGui::PopID();
++      return delta;
++    };
++    const auto text_of = [&](std::string_view name) -> std::optional<std::string> {
++      auto var = settings_.Find(name);
++      return var && *var ? std::optional<std::string>((*var)->GetText()) : std::nullopt;
++    };
++    const auto set = [&](std::string_view name, std::string_view text) {
++      WarnIfFailed(name, settings_.SetText(name, text));
++      quit_armed_ = false;
++      // No "save" step for the player: every change goes to the config file.
++      if (auto status = settings_.Save(config_path_); !status) {
++        REXUI_ERROR("{}", status.error().GetDescription());
++        notice_ = tr.save_failed;
++      }
++    };
++    const auto restarts = [&](std::string_view name) {
++      auto var = settings_.Find(name);
++      if (var && *var && (*var)->GetConstraints().life != rex::SettingLife::kLive) {
++        notice_ = tr.restart_needed;
++      } else {
++        notice_.clear();
++      }
++    };
++    // One row that cycles a setting through fixed choices. Numbers compare as numbers.
++    const auto choice = [&](const char* label, std::span<const char* const> names,
++                            std::span<const SimpleChoice> choices) {
++      const auto current = text_of(names[0]);
++      if (!current) {
++        return;
++      }
++      size_t at = choices.size();
++      for (size_t i = 0; i < choices.size(); ++i) {
++        char* end = nullptr;
++        const f64 a = std::strtod(current->c_str(), &end);
++        const bool numeric = end != current->c_str() && *end == '\0';
++        if (*current == choices[i].value ||
++            (numeric && std::fabs(a - std::strtod(choices[i].value, nullptr)) < 1e-6 &&
++             std::strtod(choices[i].value, &end) == std::strtod(choices[i].value, nullptr) &&
++             end != choices[i].value)) {
++          at = i;
++          break;
++        }
++      }
++      const char* shown = at < choices.size() ? choices[at].label : current->c_str();
++      const int delta = row(std::format("{}:   < {} >", label, shown), names[0]);
++      if (delta == 0) {
++        return;
++      }
++      const size_t count = choices.size();
++      const size_t next = at >= count ? 0 : (at + count + static_cast<size_t>(delta + static_cast<int>(count))) % count;
++      for (const char* name : names) {
++        set(name, choices[next].value);
++      }
++      restarts(names[0]);
++    };
++    // One row that moves a number in steps and shows it as a percentage.
++    const auto percent = [&](const char* label, const char* name, f64 low, f64 high, f64 step) {
++      const auto current = text_of(name);
++      if (!current) {
++        return;
++      }
++      const f64 value = std::strtod(current->c_str(), nullptr);
++      const int delta = row(std::format("{}:   < {:.0f}% >", label, value * 100.0), name);
++      if (delta == 0) {
++        return;
++      }
++      f64 next = std::round((value + step * delta) / step) * step;
++      if (next > high + 1e-9) {
++        next = delta > 0 && ImGui::IsKeyDown(ImGuiKey_GamepadFaceDown) ? low : high;
++      }
++      next = std::clamp(next, low, high);
++      set(name, std::format("{:.2f}", next));
++      restarts(name);
++    };
++
++    if (row(tr.back, "back") != 0) {
++      ui_.ShowOverlay("settings", false);
++    }
++    ImGui::Separator();
++
++    {
++      // The word "Language" stays visible so the row can be found from any language.
++      std::vector<const MenuText*> usable;
++      size_t at = 0;
++      for (const MenuText& text : kMenuTexts) {
++        if (MenuTextUsable(text)) {
++          if (&text == &tr) {
++            at = usable.size();
++          }
++          usable.push_back(&text);
++        }
++      }
++      const std::string label = &tr == &kMenuTexts[0]
++                                    ? std::string(tr.language)
++                                    : std::format("{} (Language)", tr.language);
++      const int delta = row(std::format("{}:   < {} >", label, tr.name), "language");
++      if (delta != 0 && !usable.empty()) {
++        const size_t count = usable.size();
++        const size_t next = (at + count + static_cast<size_t>(delta + static_cast<int>(count))) % count;
++        set("ui.language", usable[next]->code);
++        // A notice in the old language would be out of place.
++        notice_.clear();
++      }
++    }
++
++    static constexpr const char* kFps[] = {"gpu.frame_limit"};
++    const SimpleChoice kFpsChoices[] = {
++        {"0", tr.fps_normal}, {"45", "45"}, {"40", "40"}, {"30", tr.fps_battery}};
++    choice(tr.fps, kFps, kFpsChoices);
++
++    static constexpr const char* kScale[] = {"gpu.resolution_scale_x", "gpu.resolution_scale_y"};
++    const SimpleChoice kScaleChoices[] = {
++        {"1", tr.quality_normal}, {"2", tr.quality_high}, {"3", tr.quality_very_high}};
++    choice(tr.quality, kScale, kScaleChoices);
++
++    static constexpr const char* kSmooth[] = {"gpu.xenos.swap_post_effect"};
++    const SimpleChoice kSmoothChoices[] = {
++        {"none", tr.no}, {"fxaa", tr.yes}, {"fxaa_extreme", tr.strong}};
++    choice(tr.smooth, kSmooth, kSmoothChoices);
++
++    const SimpleChoice kOnOff[] = {{"false", tr.no}, {"true", tr.yes}};
++    static constexpr const char* kMute[] = {"apu.mute"};
++    choice(tr.mute, kMute, kOnOff);
++    percent(tr.volume, "apu.gain", 0.0, 2.0, 0.1);
++
++    static constexpr const char* kGyro[] = {"hid.sdl.gyro"};
++    choice(tr.gyro, kGyro, kOnOff);
++    if (text_of("hid.sdl.gyro").value_or("false") == "true") {
++      const std::string sensitivity = std::format("   {}", tr.sensitivity);
++      const std::string invert_x = std::format("   {}", tr.invert_x);
++      const std::string invert_y = std::format("   {}", tr.invert_y);
++      percent(sensitivity.c_str(), "hid.sdl.gyro_sensitivity", 0.2, 4.0, 0.2);
++      static constexpr const char* kGyroX[] = {"hid.sdl.gyro_invert_x"};
++      static constexpr const char* kGyroY[] = {"hid.sdl.gyro_invert_y"};
++      choice(invert_x.c_str(), kGyroX, kOnOff);
++      choice(invert_y.c_str(), kGyroY, kOnOff);
++    }
++
++    ImGui::Separator();
++    if (row(tr.counter, "counter") != 0) {
++      ui_.ToggleOverlay("debug");
++    }
++    if (row(tr.advanced, "advanced") != 0) {
++      advanced_ = true;
++    }
++    if (row(quit_armed_ ? tr.quit_confirm : tr.quit, "quit") != 0) {
++      if (quit_armed_) {
++        ui_.RequestQuit();
++      }
++      quit_armed_ = !quit_armed_;
++    }
++
++    ImGui::Separator();
++    if (!notice_.empty()) {
++      ImGui::TextWrapped("%s", notice_.c_str());
++    }
++    ImGui::TextDisabled("%s", tr.hint);
++  }
++  ImGui::End();
++  ImGui::PopStyleVar(4);
++  return keep;
++}
++
+ bool SettingsOverlayDialog::Draw(ImGuiIO& io) {
++  if ((io.BackendFlags & ImGuiBackendFlags_HasGamepad) != 0 && !advanced_) {
++    return DrawSimple(io);
++  }
+   std::vector<rex::SettingBase*> vars = settings_.Enumerate();
+ #ifdef NDEBUG
+   std::erase_if(vars, [](const rex::SettingBase* var) { return var->GetConstraints().debug_only; });
+@@ -239,8 +585,21 @@ bool SettingsOverlayDialog::Draw(ImGuiIO& io) {
+   const std::string search(search_buf_);
+   const bool searching = !search.empty();
+ 
+-  ImGui::SetNextWindowSize(ImVec2(620, 480), ImGuiCond_FirstUseEver);
+-  const Metrics& metrics = ui_.GetStyle().metrics;
++  // Driven by the pad: fill the screen and scale the fixed widths with the text.
++  const bool pad_menu = (io.BackendFlags & ImGuiBackendFlags_HasGamepad) != 0;
++  const f32 ui_scale = pad_menu ? ImGui::GetStyle().FontScaleMain : 1.0f;
++  if (pad_menu) {
++    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.05f, io.DisplaySize.y * 0.05f),
++                            ImGuiCond_Always);
++    ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x * 0.9f, io.DisplaySize.y * 0.9f),
++                             ImGuiCond_Always);
++  } else {
++    ImGui::SetNextWindowSize(ImVec2(620, 480), ImGuiCond_FirstUseEver);
++  }
++  Metrics metrics = ui_.GetStyle().metrics;
++  metrics.side_panel_width *= ui_scale;
++  metrics.footer_height *= ui_scale;
++  metrics.value_width *= ui_scale;
+   ImGui::SetNextWindowBgAlpha(metrics.window_alpha.panel);
+   if (!ImGui::Begin("Settings##rex", nullptr, ImGuiWindowFlags_NoCollapse)) {
+     ImGui::End();
+@@ -255,7 +614,8 @@ bool SettingsOverlayDialog::Draw(ImGuiIO& io) {
+   ImGui::Separator();
+ 
+   const f32 panel_width = metrics.side_panel_width;
+-  ImGui::BeginChild("##cats", ImVec2(panel_width, -metrics.footer_height), true);
++  ImGui::BeginChild("##cats", ImVec2(panel_width, -metrics.footer_height),
++                    ImGuiChildFlags_Borders | ImGuiChildFlags_NavFlattened);
+ 
+   std::function<void(const std::map<std::string, CatNode>&, int)> draw_tree;
+   draw_tree = [&](const std::map<std::string, CatNode>& nodes, int depth) {
+@@ -318,7 +678,8 @@ bool SettingsOverlayDialog::Draw(ImGuiIO& io) {
+ 
+   auto is_keybind = [](const rex::SettingBase* v) -> bool { return v->GetConstraints().key_chord; };
+ 
+-  ImGui::BeginChild("##cvars", ImVec2(0, -metrics.footer_height), false);
++  ImGui::BeginChild("##cvars", ImVec2(0, -metrics.footer_height),
++                    ImGuiChildFlags_NavFlattened);
+   for (rex::SettingBase* var : vars) {
+     const rex::SettingConstraints& constraints = var->GetConstraints();
+     const std::string& name = var->GetName();
+@@ -351,7 +712,7 @@ bool SettingsOverlayDialog::Draw(ImGuiIO& io) {
+         ImGui::BeginDisabled();
+ 
+       ImGui::Text("%-20s", description.c_str());
+-      ImGui::SameLine(240.0f);
++      ImGui::SameLine(240.0f * ui_scale);
+ 
+       bool is_capturing = (capturing_bind_name_ == name);
+ 
+@@ -393,7 +754,7 @@ bool SettingsOverlayDialog::Draw(ImGuiIO& io) {
+           }
+         }
+       } else {
+-        ImGui::SetNextItemWidth(80.0f);
++        ImGui::SetNextItemWidth(80.0f * ui_scale);
+         ImGui::Text("%-10s", current_val.c_str());
+         ImGui::SameLine();
+         if (input_ && ImGui::SmallButton("Rebind##v")) {
+@@ -457,7 +818,7 @@ bool SettingsOverlayDialog::Draw(ImGuiIO& io) {
+           ImGui::SetTooltip("[%s]", lifecycle_label);
+         }
+       }
+-      ImGui::SameLine(240.0f);
++      ImGui::SameLine(240.0f * ui_scale);
+ 
+       ImGui::SetNextItemWidth(metrics.value_width);
+       if (var->GetType() == rex::SettingType::kBool) {
+@@ -493,18 +854,27 @@ bool SettingsOverlayDialog::Draw(ImGuiIO& io) {
+                  var->GetType() == rex::SettingType::kU64) {
+         if (var->GetType() == rex::SettingType::kU32 || var->GetType() == rex::SettingType::kU64) {
+           u64 v = rex::string::from_string<u64>(current_val);
+-          if (ImGui::InputScalar("##v", ImGuiDataType_U64, &v)) {
++          const u64 step = 1;
++          if (ImGui::InputScalar("##v", ImGuiDataType_U64, &v, pad_menu ? &step : nullptr)) {
+             WarnIfFailed(name, settings_.SetText(name, ClampUnsignedText(constraints, v)));
+           }
+         } else {
+           i64 v = rex::string::from_string<i64>(current_val);
+-          if (ImGui::InputScalar("##v", ImGuiDataType_S64, &v)) {
++          const i64 step = 1;
++          if (ImGui::InputScalar("##v", ImGuiDataType_S64, &v, pad_menu ? &step : nullptr)) {
+             WarnIfFailed(name, settings_.SetText(name, ClampIntegerText(constraints, v)));
+           }
+         }
+       } else if (var->GetType() == rex::SettingType::kF64) {
+         f64 v = rex::string::from_string<f64>(current_val);
+-        if (ImGui::InputDouble("##v", &v, 0.0, 0.0, "%.4f")) {
++        // With the pad there is no keyboard: show -/+ buttons, sized to the setting's range.
++        f64 step = 0.0;
++        if (pad_menu) {
++          const f64 span = constraints.min && constraints.max ? *constraints.max - *constraints.min
++                                                               : 1.0;
++          step = span <= 10.0 ? 0.1 : span <= 100.0 ? 1.0 : 5.0;
++        }
++        if (ImGui::InputDouble("##v", &v, step, step * 10.0, "%.4f")) {
+           if (constraints.min)
+             v = std::max(v, *constraints.min);
+           if (constraints.max)
+@@ -545,6 +915,15 @@ bool SettingsOverlayDialog::Draw(ImGuiIO& io) {
+   ImGui::EndChild();
+ 
+   ImGui::Separator();
++  if (pad_menu) {
++    const auto language_var = settings_.Find("ui.language");
++    const MenuText& back_text =
++        MenuTextFor(language_var && *language_var ? (*language_var)->GetText() : std::string("en"));
++    if (ImGui::Button((std::string(back_text.back_simple) + "###back_simple").c_str())) {
++      advanced_ = false;
++    }
++    ImGui::SameLine();
++  }
+   if (ImGui::Button("Save to config")) {
+     if (auto status = settings_.Save(config_path_); !status) {
+       REXUI_ERROR("{}", status.error().GetDescription());
+diff --git a/src/ui/overlay/settings_overlay.h b/src/ui/overlay/settings_overlay.h
+index 7047f0c..15a5cf6 100644
+--- a/src/ui/overlay/settings_overlay.h
++++ b/src/ui/overlay/settings_overlay.h
+@@ -37,8 +37,18 @@ class SettingsOverlayDialog : public DialogBase {
+   ~SettingsOverlayDialog();
+ 
+   bool Draw(ImGuiIO& io) override;
++  void OnShow() override {
++    advanced_ = false;
++    quit_armed_ = false;
++    notice_.clear();
++  }
+ 
+  private:
++  /** The short menu the pad opens: a few plain choices, the full tree behind "advanced". */
++  bool DrawSimple(ImGuiIO& io);
++  bool advanced_ = false;
++  bool quit_armed_ = false;
++  std::string notice_;
+   IUISystem& ui_;
+   rex::ISettingsRegistry& settings_;
+   const rex::hid::IBindingSet* key_bindings_;
+diff --git a/src/ui/ui_state.h b/src/ui/ui_state.h
+index 5c8f44e..ce939bd 100644
+--- a/src/ui/ui_state.h
++++ b/src/ui/ui_state.h
+@@ -124,6 +124,12 @@ struct UISystem::State {
+   PointerMode applied_pointer_mode = PointerMode::kFree;
+   bool cursor_hidden_by_timeout = false;
+   bool block_acquired = false;
++  /** True while the settings overlay was opened from the pad. The game reads a neutral pad. */
++  std::atomic<bool> pad_menu{false};
++  /** Present thread only: START long press tracking. */
++  bool pad_start_down = false;
++  bool pad_start_fired = false;
++  std::chrono::steady_clock::time_point pad_start_since;
+   std::chrono::steady_clock::time_point last_pointer_motion;
+   std::vector<ScopeGuard> watches;
+ 
+@@ -144,6 +150,8 @@ struct UISystem::State {
+   void ApplyPointerMode(PointerMode mode);
+   void UpdateCursorTimeout();
+   void SyncOverlayBlock();
++  bool IsSettingsVisible() const;
++  void TogglePadMenu();
+   void DestroyPrompts() const;
+   void CreateImGui();
+   void CreateToast();
+diff --git a/src/ui/ui_system.cpp b/src/ui/ui_system.cpp
+index d2012a7..93ee2bd 100644
+--- a/src/ui/ui_system.cpp
++++ b/src/ui/ui_system.cpp
+@@ -437,6 +437,10 @@ void UISystem::ShowOverlay(std::string_view name, bool visible) {
+   }
+ }
+ 
++void UISystem::RequestQuit() {
++  PostTask([this] { state_->RequestClose(); });
++}
++
+ void UISystem::ToggleOverlay(std::string_view name) {
+   if (state_->overlays) {
+     state_->overlays->Toggle(name);
+@@ -480,15 +484,54 @@ bool UISystem::HasDialogs() const {
+ 
+ void UISystem::DrawOverlays(IOverlayRenderer& renderer) {
+   State& s = *state_;
+-  if (s.stopping.load() || s.dialog_count.load(std::memory_order_relaxed) == 0) {
++  if (s.stopping.load()) {
++    return;
++  }
++  // Pad menu: START held opens the settings overlay, a START tap closes it. Runs once per
++  // presented frame on the present thread.
++  rex::hid::PadState pad;
++  bool has_pad = false;
++  const i32 hold_ms = settings_.pad_menu_hold_ms.Get();
++  if (s.input && s.started.load()) {
++    // The title must not see the START that opens the menu.
++    s.input->SetStartHoldMs(hold_ms > 0 ? static_cast<u32>(hold_ms) : 0);
++  }
++  if (s.input && hold_ms > 0 && s.started.load()) {
++    if (auto raw = s.input->GetRawState(0)) {
++      pad = *raw;
++      has_pad = true;
++    }
++    const bool down = (pad.buttons & rex::hid::kPadStart) != 0;
++    const auto now = std::chrono::steady_clock::now();
++    bool toggle = false;
++    if (down && !s.pad_start_down) {
++      s.pad_start_since = now;
++      s.pad_start_fired = false;
++      if (s.pad_menu.load()) {
++        s.pad_start_fired = true;
++        toggle = true;
++      }
++    } else if (down && !s.pad_start_fired && !s.pad_menu.load() &&
++               now - s.pad_start_since >= std::chrono::milliseconds(hold_ms)) {
++      s.pad_start_fired = true;
++      toggle = true;
++    }
++    s.pad_start_down = down;
++    if (toggle) {
++      (void)RunSynchronous([&s] { s.TogglePadMenu(); });
++    }
++  }
++  if (s.dialog_count.load(std::memory_order_relaxed) == 0) {
+     return;
+   }
+   std::lock_guard frame(s.frame_mutex);
+   ImDrawData* data = nullptr;
+-  (void)RunSynchronous([&s, &data] {
++  const bool pad_nav = has_pad && s.pad_menu.load();
++  (void)RunSynchronous([&s, &data, pad, pad_nav] {
+     if (!s.imgui) {
+       return;
+     }
++    s.imgui->SetPadState(pad_nav ? &pad : nullptr);
+     if (!(s.style.palette == s.applied_style.palette) ||
+         !(s.style.metrics == s.applied_style.metrics)) {
+       ui::ApplyDefaultStyle(s.imgui->GetImGuiStyle(), s.style.palette, s.style.metrics);
+@@ -596,11 +639,36 @@ std::vector<ui::HostLocale> UISystem::GetPreferredLocales() {
+   return s.driver->GetPreferredLocales();
+ }
+ 
++bool UISystem::State::IsSettingsVisible() const {
++  ui::IDialog* dialog = overlays ? overlays->Get("settings") : nullptr;
++  return dialog && imgui && imgui->Contains(*dialog);
++}
++
++void UISystem::State::TogglePadMenu() {
++  if (!overlays) {
++    return;
++  }
++  const bool shown = IsSettingsVisible();
++  if (shown && !pad_menu.load()) {
++    // Opened from the keyboard: take it over instead of closing it.
++    pad_menu = true;
++    SyncOverlayBlock();
++    return;
++  }
++  pad_menu = !shown;
++  overlays->Show("settings", !shown);
++  SyncOverlayBlock();
++  REXUI_INFO("pad menu {}", pad_menu.load() ? "opened" : "closed");
++}
++
+ void UISystem::State::SyncOverlayBlock() {
+   const bool visible = overlays && overlays->IsAnyVisible();
+   overlay_visible_count = visible ? 1 : 0;
+   const bool exclusive = overlays && overlays->IsExclusiveVisible();
+-  const bool want = exclusive || prompt_count > 0;
++  if (!IsSettingsVisible()) {
++    pad_menu = false;
++  }
++  const bool want = exclusive || prompt_count > 0 || pad_menu.load();
+   if (!input) {
+     return;
+   }
+diff --git a/src/ui/ui_system.h b/src/ui/ui_system.h
+index f0be5b9..2552ba3 100644
+--- a/src/ui/ui_system.h
++++ b/src/ui/ui_system.h
+@@ -69,6 +69,7 @@ class UISystem final : public rex::ui::IUISystem, public IUIControl, public IUIT
+   ui::Style& GetStyle() override;
+   [[nodiscard]] Result<void> AddOverlays(std::span<const rex::ui::OverlayConfig> overlays) override;
+   void ShowOverlay(std::string_view name, bool visible) override;
++  void RequestQuit() override;
+   void ToggleOverlay(std::string_view name) override;
+   [[nodiscard]] Result<ui::IDialog*> GetOverlay(std::string_view name) override;
+   bool IsAnyOverlayVisible() const override;

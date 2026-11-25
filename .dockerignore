@@ -1,0 +1,4 @@
+# Keep the build context small: only patches/ is ever copied into an image.
+work/
+.git/
+docs/

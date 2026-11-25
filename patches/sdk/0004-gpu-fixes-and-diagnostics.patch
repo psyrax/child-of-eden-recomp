@@ -1,0 +1,754 @@
+diff --git a/include/rex/kernel/heap.h b/include/rex/kernel/heap.h
+index f4897dd..cff384a 100644
+--- a/include/rex/kernel/heap.h
++++ b/include/rex/kernel/heap.h
+@@ -542,6 +542,12 @@ class REX_KERNEL_API PhysicalHeap : public BaseHeap {
+   bool TriggerCallbacks(u32 virtual_address, u32 length, bool is_write, bool unwatch_exact_range,
+                         bool unprotect = true);
+ 
++  /**
++   * eden: tells the invalidation listeners that a range was just allocated, whether or not it was
++   * watched. A listener may hold state for pages it could not watch while they were unallocated.
++   */
++  void NotifyAllocated(u32 virtual_address, u32 length);
++
+   bool TriggerCallbacksLocked(u32 virtual_address, u32 length, bool is_write,
+                               bool unwatch_exact_range, bool unprotect = true);
+ 
+diff --git a/src/base/string_buffer.cpp b/src/base/string_buffer.cpp
+index a92725e..b4c743d 100644
+--- a/src/base/string_buffer.cpp
++++ b/src/base/string_buffer.cpp
+@@ -61,6 +61,11 @@ void StringBuffer::Append(char c, size_t count) {
+ }
+ 
+ void StringBuffer::Append(const char* value) {
++  // eden: some disassembly name tables have no entry (unknown fetch opcodes or formats). strlen(nullptr) killed the
++  // GPU thread in the middle of a level; print a marker instead.
++  if (!value) {
++    value = "(null)";
++  }
+   AppendBytes(reinterpret_cast<const u8*>(value), std::strlen(value));
+ }
+ 
+diff --git a/src/gpu/xenos/command_processor.cpp b/src/gpu/xenos/command_processor.cpp
+index 5e58c53..82edf68 100644
+--- a/src/gpu/xenos/command_processor.cpp
++++ b/src/gpu/xenos/command_processor.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <vector>
+ #include <bit>
+ #include <algorithm>
+ #include <chrono>
+@@ -349,7 +350,15 @@ void CommandProcessor::WriteRegister(u32 index, u32 value) {
+ 
+   // Volatile for the WAIT_REG_MEM loop.
+   const_cast<volatile u32&>(regs.values[index]) = value;
+-  if (!regs.GetRegisterInfo(index)) {
++  // eden: GetRegisterInfo is a switch with ~3500 cases that was walked on every register write just for this
++  // warning (9 % of the GPU thread, run 506). It is queried once per register and kept in a table.
++  static const std::vector<bool> known_register = [] {
++    std::vector<bool> t(xenos::RegisterFile::kRegisterCount);
++    for (u32 i = 0; i < xenos::RegisterFile::kRegisterCount; ++i)
++      t[i] = xenos::RegisterFile::GetRegisterInfo(i) != nullptr;
++    return t;
++  }();
++  if (!known_register[index]) {
+     REXGPU_WARN_ONCE(unknown_write_once_, index, "GPU: Write to unknown register ({:04X} = {:08X})",
+                      index, value);
+   }
+@@ -948,6 +957,9 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+   u32 wait = reader->ReadAndSwap<u32>();
+ 
+   bool is_memory = (wait_info & 0x10) != 0;
++  // eden: wait diagnostics. How long the GPU thread spends asleep in each kind of WAIT_REG_MEM.
++  const auto eden_wait_start = std::chrono::steady_clock::now();
++  u32 eden_wait_loops = 0, eden_wait_value = 0;
+ 
+   bool matched = false;
+   u32 attempts = 0;
+@@ -1006,6 +1018,8 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+         break;
+     }
+     if (!matched) {
++      if (!eden_wait_loops) eden_wait_value = value;
++      ++eden_wait_loops;
+       if (wait >= 0x100) {
+         PrepareForWait();
+         if (!graphics_system_->IsVSyncEnabled()) {
+@@ -1028,6 +1042,31 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+     }
+   } while (!matched);
+ 
++  if (eden_wait_loops) {
++    struct EdenWait { u32 info, addr, ref, mask, wait; u64 n, us, max_us, loops; };
++    static EdenWait table[8] = {};
++    static auto last_report = std::chrono::steady_clock::now();
++    const auto now = std::chrono::steady_clock::now();
++    const u64 us = std::chrono::duration_cast<std::chrono::microseconds>(now - eden_wait_start).count();
++    for (auto& e : table) {
++      if (e.n && (e.info != wait_info || e.addr != poll_reg_addr || e.wait != wait || e.mask != mask || e.ref != eden_wait_value)) continue;
++      e.info = wait_info; e.addr = poll_reg_addr; e.ref = eden_wait_value; e.mask = mask; e.wait = wait;
++      ++e.n; e.us += us; e.max_us = std::max(e.max_us, us); e.loops += eden_wait_loops;
++      break;
++    }
++    if (now - last_report >= std::chrono::seconds(60)) {
++      for (auto& e : table) {
++        if (!e.n) continue;
++        REXGPU_INFO("diag: wait WAIT_REG_MEM info={:02X} addr={:08X} initial_value={:08X} mask={:08X} wait={:X}: {} times, "
++                    "{:.1f} ms avg, {:.1f} ms max, {:.1f} loops avg, {:.0f} ms total",
++                    e.info, e.addr, e.ref, e.mask, e.wait, e.n, e.us / 1000.0 / e.n, e.max_us / 1000.0,
++                    static_cast<double>(e.loops) / e.n, e.us / 1000.0);
++        e = {};
++      }
++      last_report = now;
++    }
++  }
++
+   return true;
+ }
+ 
+diff --git a/src/gpu/xenos/pipeline/shader/shader.h b/src/gpu/xenos/pipeline/shader/shader.h
+index 29297f7..33c2ff0 100644
+--- a/src/gpu/xenos/pipeline/shader/shader.h
++++ b/src/gpu/xenos/pipeline/shader/shader.h
+@@ -697,6 +697,10 @@ class REX_GPU_XENOS_API Shader : public rex::NonCopyable {
+ 
+   const ConstantRegisterMap& GetConstantRegisterMap() const { return constant_register_map_; }
+ 
++  // eden: read access to the vertex bindings (to back unassigned streams; see command_processor.cpp).
++
++  const std::vector<VertexBinding>& GetVertexBindingsEden() const { return vertex_bindings_; }
++
+   /** Memory export state per control flow instruction, empty when there are no eM# writes. */
+   const std::vector<ControlFlowMemExportState>& GetControlFlowMemExportState() const {
+     return cf_memexport_info_;
+diff --git a/src/gpu/xenos/pipeline/shader/translator_disasm.cpp b/src/gpu/xenos/pipeline/shader/translator_disasm.cpp
+index 1df6451..fcd263b 100644
+--- a/src/gpu/xenos/pipeline/shader/translator_disasm.cpp
++++ b/src/gpu/xenos/pipeline/shader/translator_disasm.cpp
+@@ -339,8 +339,16 @@ void ParsedVertexFetchInstruction::Disassemble(string::StringBuffer* out) const
+     out->AppendFormat(", Offset={}", attributes.offset);
+   }
+   if (attributes.data_format != xenos::VertexFormat::kUndefined) {
+-    out->AppendFormat(", DataFormat={}",
+-                      kVertexFetchDataFormats[static_cast<int>(attributes.data_format)].name);
++    // The table has no name for some formats. Formatting a null const char* crashes.
++    const int format_index = static_cast<int>(attributes.data_format);
++    const char* format_name = format_index >= 0 && format_index < 0xff
++                                  ? kVertexFetchDataFormats[format_index].name
++                                  : nullptr;
++    if (format_name) {
++      out->AppendFormat(", DataFormat={}", format_name);
++    } else {
++      out->AppendFormat(", DataFormat=FMT_{}", format_index);
++    }
+   }
+   if (!is_mini_fetch && attributes.stride) {
+     out->AppendFormat(", Stride={}", attributes.stride);
+diff --git a/src/gpu/xenos/shared_memory.cpp b/src/gpu/xenos/shared_memory.cpp
+index 7db4abe..ce7b31c 100644
+--- a/src/gpu/xenos/shared_memory.cpp
++++ b/src/gpu/xenos/shared_memory.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <cstdlib>
+ #include <algorithm>
+ #include <cstring>
+ #include <memory>
+@@ -18,6 +19,7 @@
+ #include <rex/bit.h>
+ #include <rex/platform/perf.h>
+ #include <rex/logging/log_category.h>
++#include "gpu/xenos/physical_memory.h"
+ #include "gpu/xenos/shared_memory.h"
+ #include <rex/math.h>
+ #include <rex/memory.h>
+@@ -100,6 +102,58 @@ void SharedMemory::SetSystemPageFlagsValidWithGPUDataWritten() {
+   system_page_flags_valid_ = system_page_flags_valid_and_gpu_written_;
+ }
+ 
++u64 SharedMemory::EdenChecksum(u32 page) {
++  const u64* p = reinterpret_cast<const u64*>(
++      GetPhysicalForRead(GetMemory(), page << page_size_log2_, 1u << page_size_log2_));
++  if (!p) {
++    return 0;
++  }
++  u64 h = 1469598103934665603ull;
++  for (u32 i = 0; i < (1u << page_size_log2_) / 8; ++i) {
++    h = (h ^ p[i]) * 1099511628211ull;
++  }
++  return h | 1;
++}
++
++void SharedMemory::EdenWatch(u64 frame) {
++  auto lock = AcquireLock();
++  if (eden_checksums_.empty()) {
++    return;
++  }
++  u32 changed = 0, live = 0, first = 0, last = 0;
++  for (size_t b = 0; b < system_page_flags_valid_and_gpu_written_.size(); ++b) {
++    u64 bits = system_page_flags_valid_and_gpu_written_[b];
++    while (bits) {
++      const u32 bit = static_cast<u32>(__builtin_ctzll(bits));
++      bits &= bits - 1;
++      const u32 page = static_cast<u32>(b * 64 + bit);
++      ++live;
++      const u64 now = EdenChecksum(page);
++      if (eden_checksums_[page] && eden_checksums_[page] != now) {
++        if (!changed) {
++          first = page;
++        }
++        last = page;
++        ++changed;
++      }
++      eden_checksums_[page] = now;
++    }
++  }
++  if (changed) {
++    REXGPU_WARN("eden watch: frame {}: {} of {} GPU-written pages changed on the CPU without notice; "
++                "physical {:08X} to {:08X}",
++                frame, changed, live, first << page_size_log2_, last << page_size_log2_);
++  }
++}
++
++void SharedMemory::EdenInvalidateAll() {
++  FireWatches(0, (kBufferSize - 1) >> page_size_log2_, false);
++  auto lock = AcquireLock();
++  std::fill(system_page_flags_valid_.begin(), system_page_flags_valid_.end(), 0);
++  std::fill(system_page_flags_valid_and_gpu_written_.begin(),
++            system_page_flags_valid_and_gpu_written_.end(), 0);
++}
++
+ void SharedMemory::ClearCache() {
+   // GPU written data is kept, so the watches fire as GPU invalidations.
+   FireWatches(0, (kBufferSize - 1) >> page_size_log2_, true);
+@@ -290,6 +344,15 @@ void SharedMemory::MarkRangeValid(u32 start, u32 length, bool written_by_gpu) {
+       u64& gpu_written = system_page_flags_valid_and_gpu_written_[i];
+       gpu_written = written_by_gpu ? (gpu_written | valid_bits) : (gpu_written & ~valid_bits);
+     }
++    static const bool eden_watch = std::getenv("EDEN_GPU_WATCH") != nullptr;
++    if (eden_watch && written_by_gpu) {
++      if (eden_checksums_.empty()) {
++        eden_checksums_.resize(kBufferSize >> page_size_log2_);
++      }
++      for (u32 page = valid_page_first; page <= valid_page_last; ++page) {
++        eden_checksums_[page] = EdenChecksum(page);
++      }
++    }
+   }
+ 
+   if (write_listener_registered_) {
+diff --git a/src/gpu/xenos/shared_memory.h b/src/gpu/xenos/shared_memory.h
+index 7ff20e2..623c3c6 100644
+--- a/src/gpu/xenos/shared_memory.h
++++ b/src/gpu/xenos/shared_memory.h
+@@ -38,6 +38,11 @@ class REX_GPU_XENOS_API SharedMemory : public rex::NonCopyable, public IPhysical
+   virtual ~SharedMemory();
+   /** Implementations call it from their ClearCache. */
+   virtual void ClearCache();
++  /** eden (diagnostics): also forgets what the GPU wrote; everything is uploaded again from the CPU. */
++  void EdenInvalidateAll();
++  /** eden (diagnostics, EDEN_GPU_WATCH=1): looks for pages marked as GPU-written whose content on the
++   * CPU changed without the write watch reporting it. */
++  void EdenWatch(u64 frame);
+   void SetSystemPageFlagsValidWithGPUDataWritten();
+   void InvalidateAllPages();
+ 
+@@ -174,6 +179,8 @@ class REX_GPU_XENOS_API SharedMemory : public rex::NonCopyable, public IPhysical
+   /** Pages whose buffer contents are in sync with guest memory. */
+   std::vector<u64> system_page_flags_valid_;
+   std::vector<u64> system_page_flags_valid_and_gpu_written_;
++  std::vector<u64> eden_checksums_;
++  u64 EdenChecksum(u32 page);
+   u32 num_system_page_flags_ = 0;
+ 
+   struct GlobalWatch {
+diff --git a/src/gpu/xenos/vulkan/command_processor.cpp b/src/gpu/xenos/vulkan/command_processor.cpp
+index 97d4eff..1657b87 100644
+--- a/src/gpu/xenos/vulkan/command_processor.cpp
++++ b/src/gpu/xenos/vulkan/command_processor.cpp
+@@ -9,6 +9,10 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <cstdio>
++#include <cstdlib>
++#include <atomic>
++#include <chrono>
+ #include <algorithm>
+ #include <array>
+ #include <bit>
+@@ -2131,11 +2135,68 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
+   gamma_ramp_pwl_current_frame_ = UINT32_MAX;
+ }
+ 
++// eden: stutter diagnostics, always on and cheap. Logs every frame that takes much longer than
++// the average (with how many pipelines were compiled meanwhile) and a summary per minute. Line cap per session.
++extern std::atomic<unsigned long long> eden_diag_pipelines;
++extern std::atomic<unsigned long long> eden_diag_pipelines_us;
++extern std::atomic<unsigned long long> eden_diag_upload_bytes;
++extern std::atomic<unsigned long long> eden_diag_upload_calls;
++namespace {
++void EdenDiagFrame() {
++  using Clock = std::chrono::steady_clock;
++  static Clock::time_point before = Clock::now(), minute = before;
++  static double avg_ms = 16.7, worst_ms = 0.0, sum_ms = 0.0;
++  static unsigned long long pl_before = 0, us_before = 0, pl_minute = 0;
++  static unsigned frames = 0, stutters = 0, lines = 0, total = 0;
++  const Clock::time_point now = Clock::now();
++  const double ms = std::chrono::duration<double, std::milli>(now - before).count();
++  before = now;
++  const unsigned long long pl = eden_diag_pipelines.load(std::memory_order_relaxed);
++  const unsigned long long us = eden_diag_pipelines_us.load(std::memory_order_relaxed);
++  ++total;
++  if (total > 120 && ms < 2000.0) {
++    if (ms > 25.0 && ms > 1.6 * avg_ms) {
++      ++stutters;
++      if (lines < 1500) {
++        ++lines;
++        REXGPU_WARN("diag: stutter of {:.0f} ms (avg {:.1f}); pipelines compiled meanwhile: {} ({:.0f} ms)", ms,
++                    avg_ms, pl - pl_before, (us - us_before) / 1000.0);
++      }
++    } else {
++      avg_ms += 0.02 * (ms - avg_ms);
++    }
++    ++frames;
++    sum_ms += ms;
++    if (ms > worst_ms) worst_ms = ms;
++  }
++  pl_before = pl;
++  us_before = us;
++  if (now - minute >= std::chrono::seconds(60)) {
++    if (frames) {
++      static unsigned long long sb_minute = 0, sl_minute = 0;
++      const unsigned long long sb = eden_diag_upload_bytes.load(std::memory_order_relaxed);
++      const unsigned long long sl = eden_diag_upload_calls.load(std::memory_order_relaxed);
++      REXGPU_INFO("diag: last minute: {:.1f} fps, worst frame {:.0f} ms, stutters {}, pipelines {}, "
++                  "upload {:.2f} MB and {:.0f} calls per frame",
++                  1000.0 * frames / sum_ms, worst_ms, stutters, pl - pl_minute,
++                  (sb - sb_minute) / 1048576.0 / frames, static_cast<double>(sl - sl_minute) / frames);
++      sb_minute = sb;
++      sl_minute = sl;
++    }
++    minute = now;
++    pl_minute = pl;
++    frames = stutters = 0;
++    worst_ms = sum_ms = 0.0;
++  }
++}
++}  // namespace
++
+ void VulkanCommandProcessor::IssueSwap([[maybe_unused]] u32 frontbuffer_ptr, u32 frontbuffer_width,
+                                        u32 frontbuffer_height) {
+   REX_PROFILE_SCOPE("gpu");
+   vertex_buffers_in_sync_[0] = 0;
+   vertex_buffers_in_sync_[1] = 0;
++  EdenDiagFrame();
+ 
+   if (!graphics_system_)
+     return;
+@@ -3402,6 +3463,55 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type,
+   return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
+ }
+ 
++// eden (diagnostics): EDEN_GPU_DRAWS=1 keeps the latest draws and dumps them if the GPU is lost
++// (amdgpu hang when entering Beauty, runs 464-465). Inactive without the variable.
++namespace {
++struct EdenDraw {
++  u64 frame; u64 vs; u64 ps; u32 guest_prim; u32 guest_count; u32 host_prim; u32 host_vs_type; u32 host_count;
++  u32 tess; u32 indices; u32 memexport;
++};
++constexpr size_t kEdenDraws = 8192;
++EdenDraw eden_draws[kEdenDraws];
++size_t eden_draws_n = 0;
++bool EdenDrawsActive() {
++  static const bool active = std::getenv("EDEN_GPU_DRAWS") != nullptr;
++  return active;
++}
++// EDEN_GPU_SKIP="hash,hash": does not draw anything using a shader (vertex or pixel) with that hash. Diagnostics only.
++bool EdenSkip(u64 vs, u64 ps) {
++  static const std::vector<u64> list = [] {
++    std::vector<u64> v;
++    if (const char* e = std::getenv("EDEN_GPU_SKIP")) {
++      char* end = nullptr;
++      while (*e) {
++        u64 h = std::strtoull(e, &end, 16);
++        if (end == e) break;
++        v.push_back(h);
++        e = (*end == 0) ? end : end + 1;
++      }
++      std::fprintf(stderr, "[eden] EDEN_GPU_SKIP: %zu hashes\n", v.size());
++    }
++    return v;
++  }();
++  for (u64 h : list) if (h == vs || h == ps) return true;
++  return false;
++}
++void EdenDrawsDump() {
++  if (!EdenDrawsActive()) return;
++  size_t n = std::min(eden_draws_n, kEdenDraws);
++  std::fprintf(stderr, "[eden] EDEN_GPU_DRAWS: GPU lost; last %zu draws (of %zu)\n", n, eden_draws_n);
++  for (size_t i = eden_draws_n - n; i < eden_draws_n; ++i) {
++    const EdenDraw& d = eden_draws[i % kEdenDraws];
++    std::fprintf(stderr,
++                 "[eden] draw %zu frame=%llu gprim=%u gcount=%u hprim=%u hvs=%u hcount=%u tess=%u idx=%u memexp=%u "
++                 "vs=%016llX ps=%016llX\n",
++                 i, (unsigned long long)d.frame, d.guest_prim, d.guest_count, d.host_prim, d.host_vs_type,
++                 d.host_count, d.tess, d.indices, d.memexport, (unsigned long long)d.vs, (unsigned long long)d.ps);
++  }
++  std::fflush(stderr);
++}
++}  // namespace
++
+ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, u32 index_count,
+                                        IndexBuffer* index_buffer_info, bool major_mode_explicit) {
+ #if REXGPU_FINE_GRAINED_DRAW_SCOPES
+@@ -3766,6 +3876,37 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, u32 index
+                     "memory",
+                     vfetch_constant.address << 2, vfetch_constant.size << 2);
+       }
++      // eden (runs 464-476): the game leaves vertex streams unassigned ("invalid" constant,
++      // size 0) that the shader reads anyway (Beauty, 3rd stream of a model with shape blending). With no
++      // range requested, those pages of the sparse buffer have no memory and reading them hangs the GPU with RADV
++      // (ring gfx timeout, VK_ERROR_DEVICE_LOST). Whatever the shader can reach gets backed.
++      if (!vfetch_constant.size) {
++        u32 eden_stride_words = 0, eden_attr_words = 16;
++        for (const Shader::VertexBinding& eden_binding : vertex_shader->GetVertexBindingsEden()) {
++          if (eden_binding.fetch_constant == vfetch_index) {
++            eden_stride_words = std::max(eden_stride_words, eden_binding.stride_words);
++          }
++        }
++        u32 eden_start = vfetch_constant.address << 2;
++        u64 eden_vertices = primitive_processing_result.index_buffer_type ==
++                                    PrimitiveProcessor::ProcessedIndexBufferType::kNone
++                                ? u64(primitive_processing_result.host_draw_vertex_count)
++                                : u64(0x10000);
++        u64 eden_bytes = (eden_vertices * eden_stride_words + eden_attr_words) * 4;
++        eden_bytes = std::min<u64>(std::max<u64>(eden_bytes, 4096), 16u << 20);
++        if (eden_start < SharedMemory::kBufferSize) {
++          eden_bytes = std::min<u64>(eden_bytes, SharedMemory::kBufferSize - eden_start);
++          static bool eden_warned = false;
++          if (!eden_warned) {
++            eden_warned = true;
++            REXGPU_WARN("eden: vertex stream {} unassigned ({:08X} {:08X}); backing {} bytes from {:08X}",
++                        vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1, eden_bytes, eden_start);
++          }
++          if (!shared_memory_->RequestRange(eden_start, static_cast<u32>(eden_bytes))) {
++            REXGPU_WARN("eden: could not back the unassigned vertex stream {}", vfetch_index);
++          }
++        }
++      }
+       vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
+     }
+   }
+@@ -3843,6 +3984,50 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, u32 index
+       render_target_cache_->GetLastUpdateRenderPass(),
+       render_target_cache_->GetLastUpdateFramebuffer());
+ 
++  if (EdenSkip(vertex_shader->GetUcodeDataHash(), pixel_shader ? pixel_shader->GetUcodeDataHash() : 0)) {
++    primitive_processing_result.host_draw_vertex_count = 0;
++  }
++  {
++    // EDEN_GPU_VFETCH=hash: prints the vertex fetch constants of the first draws with that vertex shader.
++    static const u64 eden_vf_hash = [] {
++      const char* e = std::getenv("EDEN_GPU_VFETCH");
++      return e ? std::strtoull(e, nullptr, 16) : 0ull;
++    }();
++    static int eden_vf_n = 0;
++    if (eden_vf_hash && vertex_shader->GetUcodeDataHash() == eden_vf_hash && eden_vf_n < 6) {
++      ++eden_vf_n;
++      auto vgt = regs.Get<xenos::reg::VGT_DRAW_INITIATOR>();
++      std::fprintf(stderr, "[eden] vfetch: frame=%llu prim=%u count=%u hcount=%u source_select=%u idx_type=%u\n",
++                   (unsigned long long)frame_current_, static_cast<u32>(prim_type), index_count,
++                   primitive_processing_result.host_draw_vertex_count, static_cast<u32>(vgt.source_select),
++                   static_cast<u32>(primitive_processing_result.index_buffer_type));
++      for (u32 i = 0; i < rex::CountOf(constant_map_vertex.vertex_fetch_bitmap); ++i) {
++        u32 bits = constant_map_vertex.vertex_fetch_bitmap[i];
++        u32 j;
++        while (rex::bit_scan_forward(bits, &j)) {
++          bits &= ~(static_cast<u32>(1) << j);
++          xenos::VertexFetch vf = regs.GetVertexFetch(i * 32 + j);
++          std::fprintf(stderr, "[eden] vfetch:   vf%u type=%u addr=%08X bytes=%u (%08X %08X)\n", i * 32 + j,
++                       static_cast<u32>(vf.type), static_cast<u32>(vf.address) << 2, static_cast<u32>(vf.size) << 2,
++                       static_cast<u32>(vf.dword_0), static_cast<u32>(vf.dword_1));
++        }
++      }
++    }
++  }
++  if (EdenDrawsActive()) {
++    EdenDraw& d = eden_draws[eden_draws_n++ % kEdenDraws];
++    d.frame = frame_current_;
++    d.vs = vertex_shader->GetUcodeDataHash();
++    d.ps = pixel_shader ? pixel_shader->GetUcodeDataHash() : 0;
++    d.guest_prim = static_cast<u32>(prim_type);
++    d.guest_count = index_count;
++    d.host_prim = static_cast<u32>(primitive_processing_result.host_primitive_type);
++    d.host_vs_type = static_cast<u32>(primitive_processing_result.host_vertex_shader_type);
++    d.host_count = primitive_processing_result.host_draw_vertex_count;
++    d.tess = static_cast<u32>(primitive_processing_result.tessellation_mode);
++    d.indices = static_cast<u32>(primitive_processing_result.index_buffer_type);
++    d.memexport = static_cast<u32>(memexport_ranges_.size());
++  }
+   if (primitive_processing_result.index_buffer_type ==
+           PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
+       shader_32bit_index_dma) {
+@@ -5103,6 +5288,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+       REXGPU_ERROR("Failed to submit a Vulkan command buffer");
+       if (submit_result == VK_ERROR_DEVICE_LOST && !device_lost_) {
+         device_lost_ = true;
++        EdenDrawsDump();
+         if (graphics_system_) {
+           graphics_system_->OnHostGPULossFromAnyThread(true);
+         }
+@@ -5131,6 +5317,39 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+     // The frame's last submission is the one that ended.
+     closed_frame_submissions_[(frame_current_++) % kMaxFramesInFlight] = GetCurrentSubmission() - 1;
+ 
++    if (shared_memory_ && frame_current_ % 30 == 0) {
++      shared_memory_->EdenWatch(frame_current_);
++    }
++    // eden (diagnostics): EDEN_GPU_CLEAR="frames:mask" clears caches every N frames.
++    // Mask: 1 textures, 2 primitives (converted indices), 4 shared memory, 8 also forget what the GPU wrote. Does nothing without the variable.
++    {
++      static const std::pair<u32, u32> eden_clear = [] {
++        std::pair<u32, u32> v{0, 0};
++        if (const char* e = std::getenv("EDEN_GPU_CLEAR")) {
++          char* end = nullptr;
++          v.first = static_cast<u32>(std::strtoul(e, &end, 10));
++          v.second = end && *end == ':' ? static_cast<u32>(std::strtoul(end + 1, nullptr, 10)) : 7u;
++        }
++        std::fprintf(stderr, "[eden] EDEN_GPU_CLEAR: every %u frames, mask %u\n", v.first, v.second);
++        return v;
++      }();
++      if (eden_clear.first && frame_current_ % eden_clear.first == 0 &&
++          AwaitAllQueueOperationsCompletion()) {
++        if (eden_clear.second & 1) {
++          texture_cache_->ClearCache();
++        }
++        if (eden_clear.second & 2) {
++          primitive_processor_->ClearCache();
++        }
++        if (eden_clear.second & 4) {
++          shared_memory_->ClearCache();
++        }
++        if (eden_clear.second & 8) {
++          shared_memory_->EdenInvalidateAll();
++        }
++      }
++    }
++
+     if (cache_clear_requested_ && AwaitAllQueueOperationsCompletion()) {
+       cache_clear_requested_ = false;
+ 
+diff --git a/src/gpu/xenos/vulkan/pipeline_cache.cpp b/src/gpu/xenos/vulkan/pipeline_cache.cpp
+index d476c48..4e024af 100644
+--- a/src/gpu/xenos/vulkan/pipeline_cache.cpp
++++ b/src/gpu/xenos/vulkan/pipeline_cache.cpp
+@@ -28,6 +28,7 @@
+ 
+ #include <format>
+ 
++#include <chrono>
+ #include <rex/assert.h>
+ #include <rex/platform/perf.h>
+ #include <rex/logging/log_category.h>
+@@ -56,6 +57,10 @@
+ 
+ namespace rex::gpu::vulkan {
+ 
++// eden: counters for the stutter diagnostics (pipelines created and microseconds spent).
++std::atomic<unsigned long long> eden_diag_pipelines{0};
++std::atomic<unsigned long long> eden_diag_pipelines_us{0};
++
+ namespace {
+ 
+ constexpr std::string_view kPlaceholderPixelShaderSource = R"(#version 460
+@@ -3079,8 +3084,16 @@ bool VulkanPipelineCache::CreatePipeline(const PipelineCreationArguments& creati
+   const gpu::vulkan::VulkanDevice::Functions& dfn = vulkan_device->GetFunctions();
+   const VkDevice device = vulkan_device->GetDevice();
+   VkPipeline pipeline;
++  const auto eden_diag_start = std::chrono::steady_clock::now();
+   VkResult create_result = dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
+                                                          &pipeline_create_info, nullptr, &pipeline);
++  // eden: stutter diagnostics (IssueSwap reads it).
++  eden_diag_pipelines.fetch_add(1, std::memory_order_relaxed);
++  eden_diag_pipelines_us.fetch_add(
++      static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
++                           std::chrono::steady_clock::now() - eden_diag_start)
++                           .count()),
++      std::memory_order_relaxed);
+   if (create_result != VK_SUCCESS) {
+     u64 ps_hash = creation_arguments.pixel_shader
+                       ? creation_arguments.pixel_shader->GetShader().GetUcodeDataHash()
+diff --git a/src/gpu/xenos/vulkan/shared_memory.cpp b/src/gpu/xenos/vulkan/shared_memory.cpp
+index 7b91460..e8a331d 100644
+--- a/src/gpu/xenos/vulkan/shared_memory.cpp
++++ b/src/gpu/xenos/vulkan/shared_memory.cpp
+@@ -10,6 +10,8 @@
+  */
+ 
+ #include <algorithm>
++#include <atomic>
++#include <cstdlib>
+ #include <cstring>
+ #include <utility>
+ #include <vector>
+@@ -252,10 +254,62 @@ bool VulkanSharedMemory::AllocateSparseHostGPUMemoryRange(u32 offset_allocations
+   return true;
+ }
+ 
++// eden: how much game memory is uploaded to the GPU again (EdenDiagFrame summarizes it per minute).
++// EDEN_UPLOAD_DIAG=<pages>: logs every range of at least that many pages (line cap).
++std::atomic<unsigned long long> eden_diag_upload_bytes{0};
++std::atomic<unsigned long long> eden_diag_upload_calls{0};
++
+ bool VulkanSharedMemory::UploadRanges(const std::vector<std::pair<u32, u32>>& upload_page_ranges) {
+   if (upload_page_ranges.empty()) {
+     return true;
+   }
++  {
++    static const unsigned long eden_min = [] {
++      const char* e = std::getenv("EDEN_UPLOAD_DIAG");
++      return e ? std::strtoul(e, nullptr, 10) : 0ul;
++    }();
++    static int eden_lines = 0;
++    unsigned long long eden_pages = 0;
++    for (const auto& r : upload_page_ranges) {
++      eden_pages += r.second;
++      if (eden_min && r.second >= eden_min && eden_lines < 3000) {
++        ++eden_lines;
++        REXGPU_WARN("eden upload: physical {:08X}, {} KB", r.first << GetPageSizeLog2(),
++                    (static_cast<unsigned long long>(r.second) << GetPageSizeLog2()) >> 10);
++      }
++    }
++    if (eden_min) {
++      // How many of those pages carry exactly the same content as the previous time (false invalidation).
++      static std::vector<u64> checksums(kBufferSize >> 12);
++      static unsigned long long tot = 0, same = 0, blocks_touched = 0, blocks = 0;
++      for (const auto& r : upload_page_ranges) {
++        u32 same_in_block = 0, in_block = 0;
++        for (u32 pg = r.first; pg < r.first + r.second; ++pg) {
++          const u64* q = reinterpret_cast<const u64*>(GetPhysicalForRead(GetMemory(), pg << 12, 4096));
++          if (!q) continue;
++          u64 h = 1469598103934665603ull;
++          for (u32 i = 0; i < 512; ++i) h = (h ^ q[i]) * 1099511628211ull;
++          h |= 1;
++          ++tot; ++in_block;
++          if (checksums[pg] == h) { ++same; ++same_in_block; }
++          checksums[pg] = h;
++          if ((pg & 63) == 63 || pg + 1 == r.first + r.second) {
++            ++blocks;
++            if (same_in_block != in_block) ++blocks_touched;
++            same_in_block = in_block = 0;
++          }
++        }
++      }
++      static unsigned long long n = 0;
++      if (++n % 4000 == 0) {
++        REXGPU_WARN("eden upload: {} pages uploaded, {:.1f} % identical to the previous time; {} blocks of 256 KB, {:.1f} % with some change",
++                    tot, 100.0 * same / tot, blocks, 100.0 * blocks_touched / blocks);
++        tot = same = blocks = blocks_touched = 0;
++      }
++    }
++    eden_diag_upload_bytes.fetch_add(eden_pages << GetPageSizeLog2(), std::memory_order_relaxed);
++    eden_diag_upload_calls.fetch_add(1, std::memory_order_relaxed);
++  }
+   // The ranges are sorted, so front and back bound the barrier.
+   Use(Usage::kTransferDestination,
+       std::make_pair(upload_page_ranges.front().first << GetPageSizeLog2(),
+diff --git a/src/kernel/memory.cpp b/src/kernel/memory.cpp
+index 4ca5049..c102023 100644
+--- a/src/kernel/memory.cpp
++++ b/src/kernel/memory.cpp
+@@ -1775,6 +1775,31 @@ void PhysicalHeap::Initialize(kernel::GuestAddressSpace* memory, u8* membase, He
+   system_page_flags_.resize((system_page_count_ + 63) / 64);
+ }
+ 
++namespace {
++// eden: see PhysicalHeap::NotifyAllocated.
++struct EdenAllocNotice {
++  PhysicalHeap* heap;
++  u32 address = 0;
++  u32 size = 0;
++  ~EdenAllocNotice() {
++    if (size) {
++      heap->NotifyAllocated(address, size);
++    }
++  }
++};
++}  // namespace
++
++void PhysicalHeap::NotifyAllocated(u32 virtual_address, u32 length) {
++  if (virtual_address < heap_base_ || length == 0) {
++    return;
++  }
++  std::lock_guard lock(memory_->watch_mutex_);
++  const u32 physical_address = GetPhysicalAddress(virtual_address);
++  for (const auto& invalidation_callback : memory_->physical_memory_invalidation_callbacks_) {
++    invalidation_callback->first(invalidation_callback->second, physical_address, length, true);
++  }
++}
++
+ bool PhysicalHeap::Alloc(u32 size, u32 alignment, u32 allocation_type, u32 protect, bool top_down,
+                          u32* out_address) {
+   *out_address = 0;
+@@ -1785,6 +1810,8 @@ bool PhysicalHeap::Alloc(u32 size, u32 alignment, u32 allocation_type, u32 prote
+   size = rex::RoundUpNonZero(size, page_size_);
+   alignment = rex::RoundUpNonZero(alignment, page_size_);
+ 
++  // Declared before the locks so it notifies after they are released.
++  EdenAllocNotice eden_notice{this};
+   PendingScribble scribble(allocation_type, protect);
+   auto reconcile_lock = AcquireHostPageReconcileLock();
+   std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
+@@ -1808,6 +1835,8 @@ bool PhysicalHeap::Alloc(u32 size, u32 alignment, u32 allocation_type, u32 prote
+   }
+   scribble.Add(*parent_heap_, parent_address, size);
+   scribble.Add(*this, address, size);
++  eden_notice.address = address;
++  eden_notice.size = size;
+   *out_address = address;
+   return true;
+ }
+@@ -1817,6 +1846,8 @@ bool PhysicalHeap::AllocFixed(u32 base_address, u32 size, u32 alignment, u32 all
+   size = rex::RoundUpNonZero(size, page_size_);
+   alignment = rex::RoundUpNonZero(alignment, page_size_);
+ 
++  // Declared before the locks so it notifies after they are released.
++  EdenAllocNotice eden_notice{this};
+   PendingScribble scribble(allocation_type, protect);
+   auto reconcile_lock = AcquireHostPageReconcileLock();
+   std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
+@@ -1859,6 +1890,8 @@ bool PhysicalHeap::AllocFixed(u32 base_address, u32 size, u32 alignment, u32 all
+   }
+   scribble.Add(*parent_heap_, parent_base_address, size);
+   scribble.Add(*this, address, size);
++  eden_notice.address = address;
++  eden_notice.size = size;
+ 
+   return true;
+ }
+@@ -1870,6 +1903,8 @@ bool PhysicalHeap::AllocRange(u32 low_address, u32 high_address, u32 size, u32 a
+   size = rex::RoundUpNonZero(size, page_size_);
+   alignment = rex::RoundUpNonZero(alignment, page_size_);
+ 
++  // Declared before the locks so it notifies after they are released.
++  EdenAllocNotice eden_notice{this};
+   PendingScribble scribble(allocation_type, protect);
+   auto reconcile_lock = AcquireHostPageReconcileLock();
+   std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
+@@ -1895,6 +1930,8 @@ bool PhysicalHeap::AllocRange(u32 low_address, u32 high_address, u32 size, u32 a
+   }
+   scribble.Add(*parent_heap_, parent_address, size);
+   scribble.Add(*this, address, size);
++  eden_notice.address = address;
++  eden_notice.size = size;
+   *out_address = address;
+   return true;
+ }

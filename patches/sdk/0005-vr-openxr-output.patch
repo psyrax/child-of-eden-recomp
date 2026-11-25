@@ -1,0 +1,1011 @@
+diff --git a/src/gpu/xenos/CMakeLists.txt b/src/gpu/xenos/CMakeLists.txt
+index 9d7c19b..43e9da8 100644
+--- a/src/gpu/xenos/CMakeLists.txt
++++ b/src/gpu/xenos/CMakeLists.txt
+@@ -197,6 +197,14 @@ target_link_libraries(
+           Vulkan::Headers
+ )
+ 
++# Eden VR fork: headset output through OpenXR (off by default; the regular package does not depend on libopenxr_loader).
++option(REXGLUE_VR_OPENXR "Headset output through OpenXR (Eden VR fork)" OFF)
++if (REXGLUE_VR_OPENXR)
++  target_sources(rexgpu-xenos-vulkan PRIVATE host/vulkan/vulkan_openxr.cpp)
++  target_compile_definitions(rexgpu-xenos-vulkan PRIVATE REXGLUE_VR_OPENXR=1)
++  target_link_libraries(rexgpu-xenos-vulkan PRIVATE openxr_loader)
++endif ()
++
+ if (REXGLUE_GPU_D3D12)
+   rexgpu_xenos_library(
+     rexgpu-xenos-d3d12 gpu-xenos-d3d12 "ReXGlue Xenos GPU emulation on Direct3D 12"
+diff --git a/src/gpu/xenos/host/vulkan/functions/device_1_0.inc b/src/gpu/xenos/host/vulkan/functions/device_1_0.inc
+index 1478daf..7d144e0 100644
+--- a/src/gpu/xenos/host/vulkan/functions/device_1_0.inc
++++ b/src/gpu/xenos/host/vulkan/functions/device_1_0.inc
+@@ -19,6 +19,7 @@ REX_VK_FUNCTION(vkCmdBindDescriptorSets)
+ REX_VK_FUNCTION(vkCmdBindIndexBuffer)
+ REX_VK_FUNCTION(vkCmdBindPipeline)
+ REX_VK_FUNCTION(vkCmdBindVertexBuffers)
++REX_VK_FUNCTION(vkCmdBlitImage)
+ REX_VK_FUNCTION(vkCmdClearAttachments)
+ REX_VK_FUNCTION(vkCmdClearColorImage)
+ REX_VK_FUNCTION(vkCmdCopyBuffer)
+diff --git a/src/gpu/xenos/host/vulkan/vulkan_device.cpp b/src/gpu/xenos/host/vulkan/vulkan_device.cpp
+index aae5dc3..640760a 100644
+--- a/src/gpu/xenos/host/vulkan/vulkan_device.cpp
++++ b/src/gpu/xenos/host/vulkan/vulkan_device.cpp
+@@ -20,6 +20,7 @@
+ #include <rex/platform.h>
+ #include <rex/string/text.h>
+ #include "gpu/xenos/host/vulkan/vulkan_device.h"
++#include <cstdlib>
+ #include "gpu/xenos/host/vulkan/vulkan_objects.h"
+ #include "gpu/xenos/host/vulkan/vulkan_to_string.h"
+ 
+@@ -136,6 +137,20 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+     REX_VK_LOCAL_PROMOTED_EXTENSION(KHR_driver_properties, 1, 2)
+   }
+ 
++  // Eden VR fork (EDEN_VR_OPENXR=1): extensions the OpenXR runtime requires from the device to share
++  // images with its compositor (XR_KHR_vulkan_enable). Only requested when the headset output will be used.
++  static bool vr_ext[8] = {};
++  if (const char* vr = std::getenv("EDEN_VR_OPENXR"); vr && *vr == '1') {
++    static const char* const vr_names[8] = {
++        "VK_KHR_external_memory",    "VK_KHR_external_memory_fd", "VK_KHR_external_semaphore",
++        "VK_KHR_external_semaphore_fd", "VK_KHR_external_fence",  "VK_KHR_external_fence_fd",
++        "VK_KHR_image_format_list",  "VK_KHR_timeline_semaphore"};
++    for (int vr_i = 0; vr_i < 8; ++vr_i) {
++      vr_ext[vr_i] = false;
++      requested_extensions.emplace(vr_names[vr_i], &vr_ext[vr_i]);
++    }
++  }
++
+   REX_VK_STRUCT_PROMOTED_EXTENSION(KHR_dedicated_allocation, 1, 1)
+   // Required by VK_KHR_dedicated_allocation and VK_KHR_sampler_ycbcr_conversion.
+   REX_VK_STRUCT_PROMOTED_EXTENSION(KHR_get_memory_requirements2, 1, 1)
+diff --git a/src/gpu/xenos/host/vulkan/vulkan_instance.cpp b/src/gpu/xenos/host/vulkan/vulkan_instance.cpp
+index d2f5437..fe6cc7a 100644
+--- a/src/gpu/xenos/host/vulkan/vulkan_instance.cpp
++++ b/src/gpu/xenos/host/vulkan/vulkan_instance.cpp
+@@ -19,6 +19,7 @@
+ #include <rex/platform.h>
+ #include "gpu/xenos/host/library_name.h"
+ #include "gpu/xenos/host/vulkan/vulkan_instance.h"
++#include <cstdlib>
+ #include "gpu/xenos/host/vulkan/vulkan_presenter.h"
+ #include "gpu/xenos/host/vulkan/vulkan_objects.h"
+ #include "gpu/xenos/host/vulkan/vulkan_to_string.h"
+@@ -119,6 +120,17 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
+         "VK_KHR_get_physical_device_properties2",
+         &vulkan_instance->extensions_.ext_1_1_KHR_get_physical_device_properties2);
+   }
++  // Eden VR fork (EDEN_VR_OPENXR=1): instance extensions the OpenXR runtime requires.
++  static bool vr_ext[4] = {};
++  if (const char* vr = std::getenv("EDEN_VR_OPENXR"); vr && *vr == '1') {
++    static const char* const vr_names[4] = {
++        "VK_KHR_get_physical_device_properties2", "VK_KHR_external_memory_capabilities",
++        "VK_KHR_external_semaphore_capabilities", "VK_KHR_external_fence_capabilities"};
++    for (int vr_i = 0; vr_i < 4; ++vr_i) {
++      vr_ext[vr_i] = false;
++      requested_extensions.emplace(vr_names[vr_i], &vr_ext[vr_i]);
++    }
++  }
+   requested_extensions.emplace("VK_EXT_debug_utils",
+                                &vulkan_instance->extensions_.ext_EXT_debug_utils);
+   requested_extensions.emplace("VK_KHR_portability_enumeration",
+diff --git a/src/gpu/xenos/host/vulkan/vulkan_openxr.cpp b/src/gpu/xenos/host/vulkan/vulkan_openxr.cpp
+new file mode 100644
+index 0000000..f725a2c
+--- /dev/null
++++ b/src/gpu/xenos/host/vulkan/vulkan_openxr.cpp
+@@ -0,0 +1,831 @@
++// Eden VR fork, stages 3 and 4: output to a headset through OpenXR. See vulkan_openxr.h.
++#include "gpu/xenos/host/vulkan/vulkan_openxr.h"
++
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include <cmath>
++#include <cstring>
++#include <deque>
++#include <chrono>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <utility>
++#include <vector>
++
++#include "gpu/xenos/host/vulkan/vulkan_instance.h"
++#include "gpu/xenos/host/vulkan/vulkan_objects.h"
++
++#define XR_USE_GRAPHICS_API_VULKAN
++#include <openxr/openxr.h>
++#include <openxr/openxr_platform.h>
++
++// OpenXR and Vulkan structures are initialized here with their type only ({XR_TYPE_...}); the rest stays zero.
++#pragma clang diagnostic ignored "-Wmissing-field-initializers"
++
++// --- Eye mark: the game hook (eden_hooks.cpp) reports, at every end of frame, which eye it belongs to ---------------
++// Stage 4: C interface with the game (the same structures are copied in eden_hooks.cpp; change both).
++//  - rex_vr_state: latest pose of each eye and each controller (OpenXR LOCAL space, meters; quaternion x y z w;
++//    field of view in radians: left, right, up, down), already predicted for the next refresh.
++//  - rex_vr_mark_eye2: when a frame ends, which eye it belongs to and which view it was drawn with (null = no head
++//    tracking: that pair is submitted as a floating screen).
++extern "C" {
++struct RexVrView {
++  float pos[3];
++  float quat[4];
++  float fov[4];
++  int valid;
++};
++struct RexVrController {
++  int active;
++  float pos[3];
++  float quat[4];
++  float trigger;
++  float grip;
++};
++struct RexVrState {
++  int ready;  // the session is running and the views are valid
++  RexVrView eye[2];
++  RexVrController controller[2];  // 0 = left, 1 = right
++  float quad_dist, quad_width;  // floating screen: distance and width in meters (centered on the LOCAL origin)
++};
++}
++namespace {
++struct EyeMark {
++  int eye;
++  RexVrView view;
++};
++std::mutex g_eyes_mutex;
++std::deque<EyeMark> g_eyes;
++std::mutex g_state_mutex;
++RexVrState g_state{};
++}  // namespace
++
++extern "C" __attribute__((visibility("default"))) void rex_vr_mark_eye2(int eye, const RexVrView* view) {
++  EyeMark m{};
++  m.eye = eye & 1;
++  if (view) m.view = *view;
++  std::lock_guard<std::mutex> lk(g_eyes_mutex);
++  if (g_eyes.size() > 8) g_eyes.pop_front();  // nobody consumes (session not running yet): do not pile up
++  g_eyes.push_back(m);
++}
++extern "C" __attribute__((visibility("default"))) void rex_vr_mark_eye(int eye) { rex_vr_mark_eye2(eye, nullptr); }
++extern "C" __attribute__((visibility("default"))) int rex_vr_state(RexVrState* out) {
++  std::lock_guard<std::mutex> lk(g_state_mutex);
++  *out = g_state;
++  return g_state.ready;
++}
++
++namespace rex::gpu::vulkan {
++
++namespace {
++#define XRLOG(...) (std::fprintf(stderr, "[vr-xr] " __VA_ARGS__), std::fputc('\n', stderr))
++
++const char* XrText(XrInstance instance, XrResult r, char* buf) {
++  if (instance == XR_NULL_HANDLE || XR_FAILED(xrResultToString(instance, r, buf))) {
++    std::snprintf(buf, XR_MAX_RESULT_STRING_SIZE, "XrResult %d", static_cast<int>(r));
++  }
++  return buf;
++}
++}  // namespace
++
++// Two threads:
++//  - the game's GPU thread (Frame): copies each eye to its own intermediate image and, once the pair is complete, publishes it;
++//  - the headset thread (Loop): follows the runtime's pace (xrWaitFrame blocks until the next refresh) and on every
++//    refresh submits the latest published pair. This way waiting for the headset does not slow the game (measured: with everything on the
++//    GPU thread the game dropped from 120 to ~70 fps, run 250).
++// The intermediate images live in three slots (write / ready / read) so that neither thread waits for the other.
++struct VulkanXrOutput::State {
++  XrInstance instance = XR_NULL_HANDLE;
++  XrSystemId system = XR_NULL_SYSTEM_ID;
++  XrSession session = XR_NULL_HANDLE;
++  XrSpace space = XR_NULL_HANDLE;
++  std::atomic<bool> running{false};  // between xrBeginSession and xrEndSession
++  std::atomic<bool> dead{false};     // unrecoverable failure: do not try again
++  int64_t format = 0;
++  // Runtime swapchains (only the headset thread touches them).
++  uint32_t width = 0, height = 0;
++  XrSwapchain swapchain[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
++  std::vector<XrSwapchainImageVulkanKHR> images[2];
++  // Intermediate images: [slot][eye].
++  struct Intermediate {
++    VkImage image = VK_NULL_HANDLE;
++    VkDeviceMemory memory = VK_NULL_HANDLE;
++  };
++  Intermediate inter[3][2];
++  RexVrView views[3][2] = {};        // view the game drew each eye of each slot with
++  uint32_t inter_width = 0, inter_height = 0;
++  std::mutex slots_mutex;                  // protects what follows
++  int write_slot = 0, ready_slot = 1, read_slot = 2;
++  bool has_new = false, has_read = false;
++  uint32_t pub_width = 0, pub_height = 0;  // size of the published pair
++  bool left_written = false;               // the left eye of the pair in progress was already copied (GPU thread)
++  uint32_t parity = 0;                // fallback when the game does not mark the eye
++  std::atomic<uint64_t> published{0};
++  // Vulkan: one set of commands per thread.
++  VkCommandPool pool[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
++  VkCommandBuffer cmd[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
++  VkFence fence[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
++  std::thread worker;
++  float distance = 2.0f, width_m = 3.2f;
++  // Stage 4: controllers.
++  XrActionSet action_set = XR_NULL_HANDLE;
++  XrAction a_pose = XR_NULL_HANDLE, a_trigger = XR_NULL_HANDLE, a_grip = XR_NULL_HANDLE;
++  XrPath hand[2] = {XR_NULL_PATH, XR_NULL_PATH};
++  XrSpace controller_space[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
++  bool controllers = false;
++};
++
++bool VulkanXrOutput::Requested() {
++  static const bool v = [] {
++    const char* e = std::getenv("EDEN_VR_OPENXR");
++    return e && *e == '1';
++  }();
++  return v;
++}
++
++VulkanXrOutput::VulkanXrOutput(const VulkanDevice* device)
++    : device_(device), e_(std::make_unique<State>()) {}
++
++std::unique_ptr<VulkanXrOutput> VulkanXrOutput::Create(const VulkanDevice* device) {
++  std::unique_ptr<VulkanXrOutput> s(new VulkanXrOutput(device));
++  if (!s->Init()) {
++    s->e_->dead = true;  // the object is kept so it does not retry on every frame
++  }
++  return s;
++}
++
++VulkanXrOutput::~VulkanXrOutput() {
++  // Not reached in normal use: the presenter keeps the object until the process ends (see the hook
++  // in vulkan_presenter.cpp), because the headset thread uses the Vulkan device until the end.
++}
++
++bool VulkanXrOutput::Init() {
++  State& e = *e_;
++  char buf[XR_MAX_RESULT_STRING_SIZE];
++  if (const char* d = std::getenv("EDEN_VR_OPENXR_DIST"); d && *d) e.distance = std::strtof(d, nullptr);
++  if (const char* d = std::getenv("EDEN_VR_OPENXR_WIDTH"); d && *d) e.width_m = std::strtof(d, nullptr);
++
++  XrInstanceCreateInfo ici{XR_TYPE_INSTANCE_CREATE_INFO};
++  std::snprintf(ici.applicationInfo.applicationName, XR_MAX_APPLICATION_NAME_SIZE, "eden");
++  ici.applicationInfo.applicationVersion = 1;
++  ici.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 0, 0);
++  const char* extensions[] = {XR_KHR_VULKAN_ENABLE_EXTENSION_NAME};
++  ici.enabledExtensionCount = 1;
++  ici.enabledExtensionNames = extensions;
++  XrResult r = xrCreateInstance(&ici, &e.instance);
++  if (XR_FAILED(r)) {
++    XRLOG("xrCreateInstance failed: %s. Is an OpenXR runtime active (monado-service, XR_RUNTIME_JSON)?",
++          XrText(XR_NULL_HANDLE, r, buf));
++    return false;
++  }
++  XrInstanceProperties ip{XR_TYPE_INSTANCE_PROPERTIES};
++  xrGetInstanceProperties(e.instance, &ip);
++
++  XrSystemGetInfo sgi{XR_TYPE_SYSTEM_GET_INFO};
++  sgi.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
++  r = xrGetSystem(e.instance, &sgi, &e.system);
++  if (XR_FAILED(r)) {
++    XRLOG("xrGetSystem failed: %s (no headset; with Monado the simulated one works)", XrText(e.instance, r, buf));
++    return false;
++  }
++  XrSystemProperties sp{XR_TYPE_SYSTEM_PROPERTIES};
++  xrGetSystemProperties(e.instance, e.system, &sp);
++  XRLOG("runtime='%s' headset='%s'", ip.runtimeName, sp.systemName);
++
++  // The loader does not export the extension's functions: they are requested from the instance.
++  PFN_xrGetVulkanGraphicsRequirementsKHR xrGetVulkanGraphicsRequirementsKHR = nullptr;
++  PFN_xrGetVulkanDeviceExtensionsKHR xrGetVulkanDeviceExtensionsKHR = nullptr;
++  PFN_xrGetVulkanGraphicsDeviceKHR xrGetVulkanGraphicsDeviceKHR = nullptr;
++  xrGetInstanceProcAddr(e.instance, "xrGetVulkanGraphicsRequirementsKHR",
++                        reinterpret_cast<PFN_xrVoidFunction*>(&xrGetVulkanGraphicsRequirementsKHR));
++  xrGetInstanceProcAddr(e.instance, "xrGetVulkanDeviceExtensionsKHR",
++                        reinterpret_cast<PFN_xrVoidFunction*>(&xrGetVulkanDeviceExtensionsKHR));
++  xrGetInstanceProcAddr(e.instance, "xrGetVulkanGraphicsDeviceKHR",
++                        reinterpret_cast<PFN_xrVoidFunction*>(&xrGetVulkanGraphicsDeviceKHR));
++  if (!xrGetVulkanGraphicsRequirementsKHR || !xrGetVulkanDeviceExtensionsKHR || !xrGetVulkanGraphicsDeviceKHR) {
++    XRLOG("the runtime does not provide the XR_KHR_vulkan_enable functions");
++    return false;
++  }
++  XrGraphicsRequirementsVulkanKHR req{XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR};
++  r = xrGetVulkanGraphicsRequirementsKHR(e.instance, e.system, &req);
++  if (XR_FAILED(r)) {
++    XRLOG("xrGetVulkanGraphicsRequirementsKHR failed: %s", XrText(e.instance, r, buf));
++    return false;
++  }
++  {
++    uint32_t n = 0;
++    xrGetVulkanDeviceExtensionsKHR(e.instance, e.system, 0, &n, nullptr);
++    std::vector<char> names(n + 1, 0);
++    if (n) xrGetVulkanDeviceExtensionsKHR(e.instance, e.system, n, &n, names.data());
++    XRLOG("device extensions the runtime asks for: %s", names.data());
++  }
++  const VkInstance vk_instance = device_->GetVulkanInstance()->GetInstance();
++  VkPhysicalDevice xr_physical = VK_NULL_HANDLE;
++  r = xrGetVulkanGraphicsDeviceKHR(e.instance, e.system, vk_instance, &xr_physical);
++  if (XR_FAILED(r)) {
++    XRLOG("xrGetVulkanGraphicsDeviceKHR failed: %s", XrText(e.instance, r, buf));
++    return false;
++  }
++  if (xr_physical != device_->GetPhysicalDevice()) {
++    XRLOG("WARNING: the runtime wants a different GPU than the one the game uses; continuing with the game's");
++  }
++
++  const uint32_t family = device_->GetQueueFamilyGraphicsCompute();
++  XrGraphicsBindingVulkanKHR binding{XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR};
++  binding.instance = vk_instance;
++  binding.physicalDevice = device_->GetPhysicalDevice();
++  binding.device = device_->GetDevice();
++  binding.queueFamilyIndex = family;
++  binding.queueIndex = 0;
++  XrSessionCreateInfo sci{XR_TYPE_SESSION_CREATE_INFO};
++  sci.next = &binding;
++  sci.systemId = e.system;
++  {
++    const VulkanDevice::Queue::Acquisition queue = device_->AcquireQueue(family, 0);
++    r = xrCreateSession(e.instance, &sci, &e.session);
++  }
++  if (XR_FAILED(r)) {
++    XRLOG("xrCreateSession failed: %s", XrText(e.instance, r, buf));
++    return false;
++  }
++
++  XrReferenceSpaceCreateInfo rci{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
++  rci.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
++  rci.poseInReferenceSpace.orientation.w = 1.0f;
++  r = xrCreateReferenceSpace(e.session, &rci, &e.space);
++  if (XR_FAILED(r)) {
++    XRLOG("xrCreateReferenceSpace failed: %s", XrText(e.instance, r, buf));
++    return false;
++  }
++
++  e.controllers = CreateActions();
++  {
++    std::lock_guard<std::mutex> lk(g_state_mutex);
++    g_state.quad_dist = e.distance;
++    g_state.quad_width = e.width_m;
++  }
++
++  uint32_t nf = 0;
++  xrEnumerateSwapchainFormats(e.session, 0, &nf, nullptr);
++  std::vector<int64_t> formats(nf);
++  if (nf) xrEnumerateSwapchainFormats(e.session, nf, &nf, formats.data());
++  // The game's image already carries display gamma: a UNORM format is preferred so the runtime does not
++  // encode it again. If only sRGB is available it is used and the tones come out lighter (the log says so).
++  const int64_t preferred[] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R8G8B8A8_SRGB,
++                                VK_FORMAT_B8G8R8A8_SRGB};
++  for (int64_t p : preferred) {
++    for (int64_t f : formats) {
++      if (f == p) {
++        e.format = p;
++        break;
++      }
++    }
++    if (e.format) break;
++  }
++  if (!e.format) {
++    XRLOG("the runtime offers no 8-bit RGBA format (%u formats)", nf);
++    return false;
++  }
++
++  const VulkanDevice::Functions& dfn = device_->GetFunctions();
++  const VkDevice device = device_->GetDevice();
++  for (int h = 0; h < 2; ++h) {
++    VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
++    pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
++    pci.queueFamilyIndex = family;
++    if (dfn.vkCreateCommandPool(device, &pci, nullptr, &e.pool[h]) != VK_SUCCESS) return false;
++    VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
++    cai.commandPool = e.pool[h];
++    cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++    cai.commandBufferCount = 1;
++    if (dfn.vkAllocateCommandBuffers(device, &cai, &e.cmd[h]) != VK_SUCCESS) return false;
++    VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
++    if (dfn.vkCreateFence(device, &fci, nullptr, &e.fence[h]) != VK_SUCCESS) return false;
++  }
++  XRLOG("session created; swapchain format=%lld; %.1f m screen at %.1f m", static_cast<long long>(e.format),
++        e.width_m, e.distance);
++  e.worker = std::thread([this] { Loop(); });
++  e.worker.detach();
++  return true;
++}
++
++// Controllers: an aim pose, the trigger and the grip per hand. If anything fails only the controllers are lost.
++bool VulkanXrOutput::CreateActions() {
++  State& e = *e_;
++  char buf[XR_MAX_RESULT_STRING_SIZE];
++  auto path = [&](const char* t) {
++    XrPath p = XR_NULL_PATH;
++    xrStringToPath(e.instance, t, &p);
++    return p;
++  };
++  e.hand[0] = path("/user/hand/left");
++  e.hand[1] = path("/user/hand/right");
++  XrActionSetCreateInfo asi{XR_TYPE_ACTION_SET_CREATE_INFO};
++  std::snprintf(asi.actionSetName, XR_MAX_ACTION_SET_NAME_SIZE, "game");
++  std::snprintf(asi.localizedActionSetName, XR_MAX_LOCALIZED_ACTION_SET_NAME_SIZE, "Game");
++  XrResult r = xrCreateActionSet(e.instance, &asi, &e.action_set);
++  if (XR_FAILED(r)) {
++    XRLOG("xrCreateActionSet failed: %s (no controllers)", XrText(e.instance, r, buf));
++    return false;
++  }
++  auto action = [&](const char* name, const char* localized, XrActionType type, XrAction* a) {
++    XrActionCreateInfo ci{XR_TYPE_ACTION_CREATE_INFO};
++    ci.actionType = type;
++    std::snprintf(ci.actionName, XR_MAX_ACTION_NAME_SIZE, "%s", name);
++    std::snprintf(ci.localizedActionName, XR_MAX_LOCALIZED_ACTION_NAME_SIZE, "%s", localized);
++    ci.countSubactionPaths = 2;
++    ci.subactionPaths = e.hand;
++    return XR_SUCCEEDED(xrCreateAction(e.action_set, &ci, a));
++  };
++  if (!action("aim", "Aim", XR_ACTION_TYPE_POSE_INPUT, &e.a_pose) ||
++      !action("trigger", "Trigger", XR_ACTION_TYPE_FLOAT_INPUT, &e.a_trigger) ||
++      !action("grip", "Grip", XR_ACTION_TYPE_FLOAT_INPUT, &e.a_grip)) {
++    XRLOG("xrCreateAction failed (no controllers)");
++    return false;
++  }
++  // Profiles: Touch (Quest 2), Index (Monado's "remote" device for testing) and the Khronos simple one.
++  struct Profile {
++    const char* profile;
++    const char* trigger;
++    const char* grip;
++  };
++  const Profile profiles[] = {{"/interaction_profiles/oculus/touch_controller", "trigger/value", "squeeze/value"},
++                             {"/interaction_profiles/valve/index_controller", "trigger/value", "squeeze/value"},
++                             {"/interaction_profiles/khr/simple_controller", "select/click", nullptr}};
++  int accepted = 0;
++  for (const Profile& p : profiles) {
++    std::vector<XrActionSuggestedBinding> b;
++    for (int h = 0; h < 2; ++h) {
++      const std::string base = h ? "/user/hand/right/input/" : "/user/hand/left/input/";
++      b.push_back({e.a_pose, path((base + "aim/pose").c_str())});
++      b.push_back({e.a_trigger, path((base + p.trigger).c_str())});
++      if (p.grip) b.push_back({e.a_grip, path((base + p.grip).c_str())});
++    }
++    XrInteractionProfileSuggestedBinding sb{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
++    sb.interactionProfile = path(p.profile);
++    sb.countSuggestedBindings = static_cast<uint32_t>(b.size());
++    sb.suggestedBindings = b.data();
++    r = xrSuggestInteractionProfileBindings(e.instance, &sb);
++    if (XR_SUCCEEDED(r)) {
++      ++accepted;
++    } else {
++      XRLOG("the runtime does not accept the profile %s: %s", p.profile, XrText(e.instance, r, buf));
++    }
++  }
++  XrSessionActionSetsAttachInfo at{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
++  at.countActionSets = 1;
++  at.actionSets = &e.action_set;
++  r = xrAttachSessionActionSets(e.session, &at);
++  if (XR_FAILED(r)) {
++    XRLOG("xrAttachSessionActionSets failed: %s (no controllers)", XrText(e.instance, r, buf));
++    return false;
++  }
++  for (int h = 0; h < 2; ++h) {
++    XrActionSpaceCreateInfo sci{XR_TYPE_ACTION_SPACE_CREATE_INFO};
++    sci.action = e.a_pose;
++    sci.subactionPath = e.hand[h];
++    sci.poseInActionSpace.orientation.w = 1.0f;
++    if (XR_FAILED(xrCreateActionSpace(e.session, &sci, &e.controller_space[h]))) return false;
++  }
++  XRLOG("controllers: actions created (%d profiles accepted)", accepted);
++  return accepted > 0;
++}
++
++// Headset thread, once per refresh: where the eyes and controllers will be at the instant `when`.
++void VulkanXrOutput::Locate(int64_t when) {
++  State& e = *e_;
++  RexVrState n{};
++  n.quad_dist = e.distance;
++  n.quad_width = e.width_m;
++  XrViewLocateInfo li{XR_TYPE_VIEW_LOCATE_INFO};
++  li.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
++  li.displayTime = when;
++  li.space = e.space;
++  XrViewState vs{XR_TYPE_VIEW_STATE};
++  XrView v[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
++  uint32_t nv = 0;
++  if (XR_SUCCEEDED(xrLocateViews(e.session, &li, &vs, 2, &nv, v)) && nv == 2 &&
++      (vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) {
++    const bool pos = (vs.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) != 0;
++    for (int k = 0; k < 2; ++k) {
++      RexVrView& o = n.eye[k];
++      const XrPosef& p = v[k].pose;
++      if (pos) o.pos[0] = p.position.x, o.pos[1] = p.position.y, o.pos[2] = p.position.z;
++      o.quat[0] = p.orientation.x, o.quat[1] = p.orientation.y, o.quat[2] = p.orientation.z, o.quat[3] = p.orientation.w;
++      o.fov[0] = v[k].fov.angleLeft, o.fov[1] = v[k].fov.angleRight, o.fov[2] = v[k].fov.angleUp, o.fov[3] = v[k].fov.angleDown;
++      o.valid = 1;
++    }
++    n.ready = 1;
++  }
++  if (e.controllers) {
++    XrActiveActionSet active{e.action_set, XR_NULL_PATH};
++    XrActionsSyncInfo si{XR_TYPE_ACTIONS_SYNC_INFO};
++    si.countActiveActionSets = 1;
++    si.activeActionSets = &active;
++    if (xrSyncActions(e.session, &si) == XR_SUCCESS) {  // XR_SESSION_NOT_FOCUSED: no controllers without focus
++      for (int h = 0; h < 2; ++h) {
++        RexVrController& m = n.controller[h];
++        XrSpaceLocation loc{XR_TYPE_SPACE_LOCATION};
++        const XrSpaceLocationFlags wanted = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT;
++        if (XR_SUCCEEDED(xrLocateSpace(e.controller_space[h], e.space, when, &loc)) && (loc.locationFlags & wanted) == wanted) {
++          m.active = 1;
++          m.pos[0] = loc.pose.position.x, m.pos[1] = loc.pose.position.y, m.pos[2] = loc.pose.position.z;
++          m.quat[0] = loc.pose.orientation.x, m.quat[1] = loc.pose.orientation.y, m.quat[2] = loc.pose.orientation.z,
++          m.quat[3] = loc.pose.orientation.w;
++        }
++        XrActionStateGetInfo gi{XR_TYPE_ACTION_STATE_GET_INFO};
++        gi.subactionPath = e.hand[h];
++        XrActionStateFloat f{XR_TYPE_ACTION_STATE_FLOAT};
++        gi.action = e.a_trigger;
++        if (XR_SUCCEEDED(xrGetActionStateFloat(e.session, &gi, &f)) && f.isActive) m.trigger = f.currentState;
++        f = {XR_TYPE_ACTION_STATE_FLOAT};
++        gi.action = e.a_grip;
++        if (XR_SUCCEEDED(xrGetActionStateFloat(e.session, &gi, &f)) && f.isActive) m.grip = f.currentState;
++      }
++    }
++  }
++  std::lock_guard<std::mutex> lk(g_state_mutex);
++  g_state = n;
++}
++
++void VulkanXrOutput::PollEvents() {
++  State& e = *e_;
++  char buf[XR_MAX_RESULT_STRING_SIZE];
++  for (;;) {
++    XrEventDataBuffer ev{XR_TYPE_EVENT_DATA_BUFFER};
++    if (xrPollEvent(e.instance, &ev) != XR_SUCCESS) break;
++    if (ev.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
++      XRLOG("the runtime is going away (instance loss): headset output disabled");
++      e.dead = true;
++      e.running = false;
++    } else if (ev.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
++      const auto& sc = *reinterpret_cast<const XrEventDataSessionStateChanged*>(&ev);
++      XRLOG("session state -> %d", static_cast<int>(sc.state));
++      if (sc.state == XR_SESSION_STATE_READY) {
++        XrSessionBeginInfo bi{XR_TYPE_SESSION_BEGIN_INFO};
++        bi.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
++        const XrResult r = xrBeginSession(e.session, &bi);
++        e.running = XR_SUCCEEDED(r);
++        if (!e.running) XRLOG("xrBeginSession failed: %s", XrText(e.instance, r, buf));
++      } else if (sc.state == XR_SESSION_STATE_STOPPING) {
++        xrEndSession(e.session);
++        e.running = false;
++      } else if (sc.state == XR_SESSION_STATE_EXITING || sc.state == XR_SESSION_STATE_LOSS_PENDING) {
++        e.running = false;
++        e.dead = true;
++      }
++      if (!e.running) {
++        std::lock_guard<std::mutex> lk(g_state_mutex);
++        g_state.ready = 0;
++      }
++    }
++  }
++}
++
++bool VulkanXrOutput::CreateSwapchains(uint32_t width, uint32_t height) {
++  State& e = *e_;
++  char buf[XR_MAX_RESULT_STRING_SIZE];
++  const uint32_t family = device_->GetQueueFamilyGraphicsCompute();
++  for (int eye = 0; eye < 2; ++eye) {
++    if (e.swapchain[eye] != XR_NULL_HANDLE) {
++      xrDestroySwapchain(e.swapchain[eye]);
++      e.swapchain[eye] = XR_NULL_HANDLE;
++    }
++    XrSwapchainCreateInfo ci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
++    ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT |
++                    XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
++    ci.format = e.format;
++    ci.sampleCount = 1;
++    ci.width = width;
++    ci.height = height;
++    ci.faceCount = 1;
++    ci.arraySize = 1;
++    ci.mipCount = 1;
++    XrResult r;
++    {
++      const VulkanDevice::Queue::Acquisition queue = device_->AcquireQueue(family, 0);
++      r = xrCreateSwapchain(e.session, &ci, &e.swapchain[eye]);
++    }
++    if (XR_FAILED(r)) {
++      XRLOG("xrCreateSwapchain(eye %d, %ux%u) failed: %s", eye, width, height, XrText(e.instance, r, buf));
++      return false;
++    }
++    uint32_t n = 0;
++    xrEnumerateSwapchainImages(e.swapchain[eye], 0, &n, nullptr);
++    e.images[eye].assign(n, XrSwapchainImageVulkanKHR{XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
++    r = xrEnumerateSwapchainImages(e.swapchain[eye], n, &n,
++                                   reinterpret_cast<XrSwapchainImageBaseHeader*>(e.images[eye].data()));
++    if (XR_FAILED(r) || !n) {
++      XRLOG("xrEnumerateSwapchainImages(eye %d) failed: %s", eye, XrText(e.instance, r, buf));
++      return false;
++    }
++  }
++  e.width = width;
++  e.height = height;
++  XRLOG("swapchains created: %ux%u per eye, %zu images each", width, height, e.images[0].size());
++  return true;
++}
++
++namespace {
++void Barrier(const VulkanDevice::Functions& dfn, VkCommandBuffer cmd, VkImage image, VkImageLayout src, VkImageLayout dst) {
++  VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
++  b.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
++  b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
++  b.oldLayout = src;
++  b.newLayout = dst;
++  b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++  b.image = image;
++  b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++  dfn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr,
++                           0, nullptr, 1, &b);
++}
++void Blit(const VulkanDevice::Functions& dfn, VkCommandBuffer cmd, VkImage src, uint32_t src_w, uint32_t src_h, VkImage dst,
++          uint32_t dst_w, uint32_t dst_h) {
++  VkImageBlit region{};
++  region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++  region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++  region.srcOffsets[1] = {static_cast<int32_t>(src_w), static_cast<int32_t>(src_h), 1};
++  region.dstOffsets[1] = {static_cast<int32_t>(dst_w), static_cast<int32_t>(dst_h), 1};
++  dfn.vkCmdBlitImage(cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region,
++                     VK_FILTER_LINEAR);
++}
++}  // namespace
++
++// Submits thread h's command buffer and waits for the GPU to finish.
++bool VulkanXrOutput::Submit(int h) {
++  State& e = *e_;
++  const VulkanDevice::Functions& dfn = device_->GetFunctions();
++  const VkDevice device = device_->GetDevice();
++  VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
++  si.commandBufferCount = 1;
++  si.pCommandBuffers = &e.cmd[h];
++  VkResult vr;
++  {
++    const VulkanDevice::Queue::Acquisition queue =
++        device_->AcquireQueue(device_->GetQueueFamilyGraphicsCompute(), 0);
++    vr = dfn.vkQueueSubmit(queue.GetQueue(), 1, &si, e.fence[h]);
++  }
++  if (vr != VK_SUCCESS) return false;
++  vr = dfn.vkWaitForFences(device, 1, &e.fence[h], VK_TRUE, 2'000'000'000ull);
++  dfn.vkResetFences(device, 1, &e.fence[h]);
++  return vr == VK_SUCCESS;
++}
++
++bool VulkanXrOutput::CreateIntermediates(uint32_t width, uint32_t height) {
++  State& e = *e_;
++  const VulkanDevice::Functions& dfn = device_->GetFunctions();
++  const VkDevice device = device_->GetDevice();
++  std::lock_guard<std::mutex> lk(e.slots_mutex);  // the headset thread must not be reading while they are rebuilt
++  for (auto& slot : e.inter) {
++    for (State::Intermediate& i : slot) {
++      if (i.image != VK_NULL_HANDLE) dfn.vkDestroyImage(device, i.image, nullptr);
++      if (i.memory != VK_NULL_HANDLE) dfn.vkFreeMemory(device, i.memory, nullptr);
++      i = {};
++      VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
++      ci.imageType = VK_IMAGE_TYPE_2D;
++      ci.format = static_cast<VkFormat>(e.format);
++      ci.extent = {width, height, 1};
++      ci.mipLevels = 1;
++      ci.arrayLayers = 1;
++      ci.samples = VK_SAMPLE_COUNT_1_BIT;
++      ci.tiling = VK_IMAGE_TILING_OPTIMAL;
++      ci.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++      ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++      ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++      if (!objects::CreateDedicatedAllocationImage(device_, ci, objects::MemoryPurpose::kDeviceLocal, i.image,
++                                                   i.memory)) {
++        XRLOG("could not create a %ux%u intermediate image", width, height);
++        return false;
++      }
++    }
++  }
++  e.inter_width = width;
++  e.inter_height = height;
++  e.has_new = e.has_read = false;
++  e.left_written = false;
++  return true;
++}
++
++// The game's GPU thread: one eye per call.
++void VulkanXrOutput::Frame(VkImage image, uint32_t width, uint32_t height) {
++  State& e = *e_;
++  if (e.dead) return;
++  int eye = -1;
++  RexVrView view{};
++  {
++    std::lock_guard<std::mutex> lk(g_eyes_mutex);
++    if (!g_eyes.empty()) {
++      eye = g_eyes.front().eye;
++      view = g_eyes.front().view;
++      g_eyes.pop_front();
++    }
++  }
++  if (eye < 0) eye = static_cast<int>(e.parity & 1);  // the game does not mark: alternate blindly
++  ++e.parity;
++  if (!e.running) return;
++  if (e.inter_width != width || e.inter_height != height) {
++    if (!CreateIntermediates(width, height)) {
++      e.dead = true;
++      return;
++    }
++  }
++  if (eye == 1 && !e.left_written) return;  // incomplete pair: wait for the next left eye
++
++  const VulkanDevice::Functions& dfn = device_->GetFunctions();
++  const VkImage dest = e.inter[e.write_slot][eye].image;  // only this thread changes write_slot
++  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++  bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++  dfn.vkBeginCommandBuffer(e.cmd[0], &bi);
++  // Source: from the presenter's internal layout (shader read) to transfer source, and back.
++  Barrier(dfn, e.cmd[0], image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++  Barrier(dfn, e.cmd[0], dest, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++  Blit(dfn, e.cmd[0], image, width, height, dest, width, height);
++  Barrier(dfn, e.cmd[0], image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++  Barrier(dfn, e.cmd[0], dest, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++  dfn.vkEndCommandBuffer(e.cmd[0]);
++  if (!Submit(0)) {
++    XRLOG("copying eye %d to the intermediate image failed", eye);
++    e.left_written = false;
++    return;
++  }
++  e.views[e.write_slot][eye] = view;
++  if (eye == 0) {
++    e.left_written = true;
++    return;
++  }
++  e.left_written = false;
++  {
++    std::lock_guard<std::mutex> lk(e.slots_mutex);
++    std::swap(e.write_slot, e.ready_slot);
++    e.has_new = true;
++    e.pub_width = width;
++    e.pub_height = height;
++  }
++  ++e.published;
++}
++
++// Headset thread.
++void VulkanXrOutput::Loop() {
++  State& e = *e_;
++  char buf[XR_MAX_RESULT_STRING_SIZE];
++  const VulkanDevice::Functions& dfn = device_->GetFunctions();
++  const uint32_t family = device_->GetQueueFamilyGraphicsCompute();
++  uint64_t refreshes = 0, with_image = 0, fresh = 0, published_before = 0;
++  auto before = std::chrono::steady_clock::now();
++  uint32_t pair_width = 0, pair_height = 0;
++  uint64_t with_projection = 0;
++
++  while (!e.dead) {
++    PollEvents();
++    if (!e.running) {
++      std::this_thread::sleep_for(std::chrono::milliseconds(10));
++      continue;
++    }
++    XrFrameState fs{XR_TYPE_FRAME_STATE};
++    XrResult r = xrWaitFrame(e.session, nullptr, &fs);
++    if (XR_SUCCEEDED(r)) {
++      const VulkanDevice::Queue::Acquisition queue = device_->AcquireQueue(family, 0);
++      r = xrBeginFrame(e.session, nullptr);
++    }
++    if (XR_FAILED(r)) {
++      XRLOG("xrWaitFrame/xrBeginFrame failed: %s; headset output disabled", XrText(e.instance, r, buf));
++      e.dead = true;
++      break;
++    }
++
++    Locate(fs.predictedDisplayTime);
++
++    bool have = false, projection = false;
++    RexVrView pair_view[2] = {};
++    if (fs.shouldRender == XR_TRUE) {
++      // The read slot stays held (locked) while it is copied: the other thread never writes to it, and only
++      // needs the lock for an instant when publishing or rebuilding the images.
++      std::unique_lock<std::mutex> lk(e.slots_mutex);
++      if (e.has_new) {
++        std::swap(e.ready_slot, e.read_slot);
++        e.has_new = false;
++        e.has_read = true;
++        pair_width = e.pub_width;
++        pair_height = e.pub_height;
++        ++fresh;
++      }
++      if (e.has_read && pair_width == e.inter_width && pair_height == e.inter_height) {
++        if (e.swapchain[0] == XR_NULL_HANDLE || e.width != pair_width || e.height != pair_height) {
++          if (!CreateSwapchains(pair_width, pair_height)) {
++            e.dead = true;
++            break;
++          }
++        }
++        uint32_t index[2] = {0, 0};
++        bool acquired[2] = {false, false};
++        for (int eye = 0; eye < 2; ++eye) {
++          const VulkanDevice::Queue::Acquisition queue = device_->AcquireQueue(family, 0);
++          XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
++          r = xrAcquireSwapchainImage(e.swapchain[eye], &ai, &index[eye]);
++          if (XR_SUCCEEDED(r)) {
++            XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
++            wi.timeout = XR_INFINITE_DURATION;
++            r = xrWaitSwapchainImage(e.swapchain[eye], &wi);
++          }
++          acquired[eye] = XR_SUCCEEDED(r);
++        }
++        if (acquired[0] && acquired[1]) {
++          VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++          bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++          dfn.vkBeginCommandBuffer(e.cmd[1], &bi);
++          for (int eye = 0; eye < 2; ++eye) {
++            const VkImage dest = e.images[eye][index[eye]].image;
++            // The destination is overwritten entirely; XR_KHR_vulkan_enable requires returning it as a color attachment.
++            Barrier(dfn, e.cmd[1], dest, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++            Blit(dfn, e.cmd[1], e.inter[e.read_slot][eye].image, pair_width, pair_height, dest, e.width, e.height);
++            Barrier(dfn, e.cmd[1], dest, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++          }
++          dfn.vkEndCommandBuffer(e.cmd[1]);
++          have = Submit(1);
++          pair_view[0] = e.views[e.read_slot][0];
++          pair_view[1] = e.views[e.read_slot][1];
++          projection = pair_view[0].valid && pair_view[1].valid;
++        }
++        for (int eye = 0; eye < 2; ++eye) {
++          if (!acquired[eye]) continue;
++          const VulkanDevice::Queue::Acquisition queue = device_->AcquireQueue(family, 0);
++          XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
++          if (XR_FAILED(xrReleaseSwapchainImage(e.swapchain[eye], &ri))) have = false;
++        }
++      }
++    }
++
++    XrCompositionLayerQuad layer[2];
++    XrCompositionLayerProjection proj_layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
++    XrCompositionLayerProjectionView proj_view[2];
++    const XrCompositionLayerBaseHeader* layers[2];
++    if (have && projection) {
++      // The game drew each eye with the headset's pose and field of view: it is submitted as is and the compositor
++      // corrects the difference between that pose and the one at display time.
++      for (int k = 0; k < 2; ++k) {
++        const RexVrView& o = pair_view[k];
++        proj_view[k] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
++        proj_view[k].pose.position = {o.pos[0], o.pos[1], o.pos[2]};
++        proj_view[k].pose.orientation = {o.quat[0], o.quat[1], o.quat[2], o.quat[3]};
++        proj_view[k].fov = {o.fov[0], o.fov[1], o.fov[2], o.fov[3]};
++        proj_view[k].subImage.swapchain = e.swapchain[k];
++        proj_view[k].subImage.imageRect.extent = {static_cast<int32_t>(e.width), static_cast<int32_t>(e.height)};
++      }
++      proj_layer.space = e.space;
++      proj_layer.viewCount = 2;
++      proj_layer.views = proj_view;
++      layers[0] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&proj_layer);
++    } else if (have) {
++      for (int k = 0; k < 2; ++k) {
++        layer[k] = {XR_TYPE_COMPOSITION_LAYER_QUAD};
++        layer[k].space = e.space;
++        layer[k].eyeVisibility = k ? XR_EYE_VISIBILITY_RIGHT : XR_EYE_VISIBILITY_LEFT;
++        layer[k].subImage.swapchain = e.swapchain[k];
++        layer[k].subImage.imageRect.extent = {static_cast<int32_t>(e.width), static_cast<int32_t>(e.height)};
++        layer[k].pose.orientation.w = 1.0f;
++        layer[k].pose.position = {0.0f, 0.0f, -e.distance};
++        layer[k].size = {e.width_m, e.width_m * static_cast<float>(e.height) / static_cast<float>(e.width)};
++        layers[k] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer[k]);
++      }
++    }
++    XrFrameEndInfo end_info{XR_TYPE_FRAME_END_INFO};
++    end_info.displayTime = fs.predictedDisplayTime;
++    end_info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
++    end_info.layerCount = have ? (projection ? 1 : 2) : 0;
++    end_info.layers = have ? layers : nullptr;
++    {
++      const VulkanDevice::Queue::Acquisition queue = device_->AcquireQueue(family, 0);
++      r = xrEndFrame(e.session, &end_info);
++    }
++    if (XR_FAILED(r)) {
++      XRLOG("xrEndFrame failed: %s", XrText(e.instance, r, buf));
++    }
++    ++refreshes;
++    if (have) ++with_image;
++    if (have && projection) ++with_projection;
++    if (with_image == 1 && have) XRLOG("first pair submitted to the headset (%ux%u per eye)", e.width, e.height);
++    if (refreshes % 600 == 0) {
++      const auto now = std::chrono::steady_clock::now();
++      const double s = std::chrono::duration<double>(now - before).count();
++      before = now;
++      const uint64_t pub = e.published.load();
++      XRLOG("headset: %.1f refreshes/s, %.1f with a new pair/s; the game published %.1f pairs/s (submitted in total=%llu)",
++            600.0 / s, static_cast<double>(fresh) / s, static_cast<double>(pub - published_before) / s,
++            static_cast<unsigned long long>(with_image));
++      RexVrState st;
++      rex_vr_state(&st);
++      XRLOG("head: valid=%d pos=%.2f,%.2f,%.2f quat=%.3f,%.3f,%.3f,%.3f fov=%.0f,%.0f,%.0f,%.0f | pairs with projection=%llu | "
++            "controllers left=%d trig=%.2f grip=%.2f right=%d trig=%.2f grip=%.2f",
++            st.eye[0].valid, st.eye[0].pos[0], st.eye[0].pos[1], st.eye[0].pos[2], st.eye[0].quat[0], st.eye[0].quat[1],
++            st.eye[0].quat[2], st.eye[0].quat[3], st.eye[0].fov[0] * 57.3f, st.eye[0].fov[1] * 57.3f, st.eye[0].fov[2] * 57.3f,
++            st.eye[0].fov[3] * 57.3f, static_cast<unsigned long long>(with_projection), st.controller[0].active, st.controller[0].trigger,
++            st.controller[0].grip, st.controller[1].active, st.controller[1].trigger, st.controller[1].grip);
++      fresh = 0;
++      published_before = pub;
++    }
++  }
++}
++
++}  // namespace rex::gpu::vulkan
+diff --git a/src/gpu/xenos/host/vulkan/vulkan_openxr.h b/src/gpu/xenos/host/vulkan/vulkan_openxr.h
+new file mode 100644
+index 0000000..b56ecd3
+--- /dev/null
++++ b/src/gpu/xenos/host/vulkan/vulkan_openxr.h
+@@ -0,0 +1,45 @@
++// Eden VR fork, stage 3: output to a headset through OpenXR.
++// Only compiled with -DREXGLUE_VR_OPENXR=ON and only enabled with EDEN_VR_OPENXR=1.
++//
++// Every frame the game finishes is ONE eye (eden's camera hook alternates the eye per frame). Here the game's
++// output image is copied to that eye's XrSwapchain and, once the pair is complete, submitted to the runtime as two
++// "quad" layers (each visible to one eye only): a floating stereo screen in front of the player.
++// Stage 4: it also publishes the pose of each eye and each controller to the game (rex_vr_state); if the game drew
++// the pair with those views (rex_vr_mark_eye2), it is submitted as a projection layer with head tracking.
++#pragma once
++
++#include <cstdint>
++#include <memory>
++
++#include "gpu/xenos/host/vulkan/vulkan_device.h"
++
++namespace rex::gpu::vulkan {
++
++class VulkanXrOutput {
++ public:
++  // true if EDEN_VR_OPENXR=1 (the device queries it too, to request the extensions the runtime requires).
++  static bool Requested();
++  static std::unique_ptr<VulkanXrOutput> Create(const VulkanDevice* device);
++  ~VulkanXrOutput();
++
++  // Called on the GPU thread right after the game refreshes its output image (in
++  // kGuestOutputInternalLayout). Does not wait for the headset: it only copies the eye to an intermediate image.
++  void Frame(VkImage image, uint32_t width, uint32_t height);
++
++ private:
++  struct State;
++  explicit VulkanXrOutput(const VulkanDevice* device);
++  bool Init();
++  void PollEvents();
++  bool CreateSwapchains(uint32_t width, uint32_t height);
++  bool CreateIntermediates(uint32_t width, uint32_t height);
++  bool CreateActions();
++  void Locate(int64_t when);
++  bool Submit(int thread_index);
++  void Loop();
++
++  const VulkanDevice* device_;
++  std::unique_ptr<State> e_;
++};
++
++}  // namespace rex::gpu::vulkan
+diff --git a/src/gpu/xenos/host/vulkan/vulkan_presenter.cpp b/src/gpu/xenos/host/vulkan/vulkan_presenter.cpp
+index 5645de1..6b2a2d5 100644
+--- a/src/gpu/xenos/host/vulkan/vulkan_presenter.cpp
++++ b/src/gpu/xenos/host/vulkan/vulkan_presenter.cpp
+@@ -26,6 +26,9 @@
+ #include <rex/platform.h>
+ #include "gpu/xenos/host/vulkan/vulkan_presenter.h"
+ #include "gpu/xenos/host/vulkan/vulkan_objects.h"
++#if REXGLUE_VR_OPENXR
++#include "gpu/xenos/host/vulkan/vulkan_openxr.h"
++#endif
+ 
+ #if REX_PLATFORM_GNU_LINUX
+ #include <X11/Xlib-xcb.h>
+@@ -555,6 +558,14 @@ bool VulkanPresenter::DriverRefreshGuestOutput(
+   bool refresher_succeeded = refresher(context);
+   if (refresher_succeeded) {
+     image_instance.ever_successfully_refreshed = true;
++#if REXGLUE_VR_OPENXR
++    // Eden VR fork: this frame is one eye; it is copied to its XrSwapchain (see vulkan_openxr.h).
++    if (VulkanXrOutput::Requested()) {
++      // Never destroyed on purpose: its thread uses the device until the process ends.
++      static VulkanXrOutput* const xr_output = VulkanXrOutput::Create(vulkan_device_).release();
++      xr_output->Frame(image_instance.image->GetImage(), frontbuffer_width, frontbuffer_height);
++    }
++#endif
+   }
+   // The refresher may have submitted commands using the image even on failure.
+   image_instance.last_refresher_submission =
