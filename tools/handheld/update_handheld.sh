@@ -23,7 +23,7 @@ S="ssh -o ConnectTimeout=10 -o BatchMode=yes -o ServerAliveInterval=15 -o Server
 src_run() { if [ -n "$SRC" ]; then $S "$SRC" "bash -c $(printf %q "$1")"; else bash -c "$1"; fi; }
 WHERE=${SRC:-this machine}
 # Only the files the package ships are compared: the handheld also has bin/eden.toml (local settings), which is left alone.
-list=$(src_run "cd $PKG && ls -d bin/* play.sh; [ -d cache_base ] && find cache_base -type f | sort" | tr '\n' ' ') || { echo "ERROR: could not read the package $PKG on $WHERE. Check the path${SRC:+ and 'ssh $SRC'}." >&2; exit 1; }
+list=$(src_run "cd $PKG && ls -d bin/* play.sh; if [ -d cache_base ]; then find cache_base -type f | sort; fi" | tr '\n' ' ') || { echo "ERROR: could not read the package $PKG on $WHERE. Check the path${SRC:+ and 'ssh $SRC'}." >&2; exit 1; }
 [ -n "${list// /}" ] || { echo "ERROR: the package $PKG on $WHERE is empty; nothing is updated." >&2; exit 1; }
 new=$(src_run "cd $PKG && sha256sum $list 2>&1 | sha256sum | cut -c1-16") || { echo "ERROR: could not read the package $PKG on $WHERE. Check the path${SRC:+ and 'ssh $SRC'}." >&2; exit 1; }
 [ ${#new} = 16 ] || { echo "ERROR: empty package checksum; nothing is updated." >&2; exit 1; }
@@ -34,7 +34,7 @@ echo "package=$new handheld=$current"
 if $S "$HANDHELD" 'pgrep -x eden >/dev/null'; then echo "ERROR: the game is open on the handheld. Close it (hold START -> Quit) and run this again." >&2; exit 1; fi
 [ $DRY = 1 ] && { echo "(--dry-run) bin/ would be backed up and bin/, play.sh and cache_base/ would be copied"; exit 0; }
 stamp=$(date +%Y%m%d-%H%M)
-$S "$HANDHELD" "bash -c 'cd $DEST && [ -e bin.prev-$stamp ] || cp -a bin bin.prev-$stamp; [ -e play.sh.prev-$stamp ] || cp -p play.sh play.sh.prev-$stamp'"
+$S "$HANDHELD" "bash -c 'cd $DEST && [ -e bin.prev-$stamp ] || cp -a bin bin.prev-$stamp; [ ! -e play.sh ] || [ -e play.sh.prev-$stamp ] || cp -p play.sh play.sh.prev-$stamp'"
 src_run "cd $PKG && tar -cf - bin play.sh \$([ -d cache_base ] && echo cache_base)" | $S "$HANDHELD" "bash -c \"tar -C $DEST -xf -\""
 final=$(remote_sum)
 [ "$final" = "$new" ] || { echo "ERROR: the copy does not match (handheld=$final). To go back: on the handheld, rm -r bin && mv bin.prev-$stamp bin" >&2; exit 1; }
